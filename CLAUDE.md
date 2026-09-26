@@ -18,7 +18,8 @@ The user writes in Moroccan Darija or Arabic. All UI text is Darija, in an RTL p
 | `eskali_api_launcher.sh` | `start` (background + opens browser) / `stop`. PID in `~/.api-test-console/eskali_api.pid`, log in `eskali_api.log`. Port from `ESKALI_API_PORT` (default 8000). |
 | `install_eskali_api.sh` | Installs the apps-menu `.desktop` entry, icon and desktop shortcut (generated, not stored in the repo). `--uninstall` removes them. |
 | `run-api-dashboard.sh`, `Run API Dashboard.bat`, `create_shortcut.vbs` | Foreground run on Linux / Windows. |
-| `ReadMe.txt` | User-facing instructions (Arabic/Darija). |
+| `README.md` | User-facing overview and run instructions (Linux / Windows). |
+| `assets/` | `eskali_api_icon.png` (Linux app + notifications), `api_dashboard_icon.ico` (Windows shortcut). The page favicon is inline in `INDEX_HTML`. |
 
 History is in git. Don't make backup copies of files; commit instead.
 
