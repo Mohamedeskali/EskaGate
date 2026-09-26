@@ -38,7 +38,7 @@ Everything lives in `~/.api-test-console/` (override with `API_CONSOLE_HOME`): t
 | `agent-models.json` | Per-agent model filter |
 | `agent-backups/` | Copies of agent configs taken before Enable |
 
-The page keeps a localStorage copy of profiles and formats as a fallback. On load it merges browser-only entries into the server store.
+Tabs save profiles/formats as per-entry ops (`POST /api/store/<name>` with `{ops}`: create / set+unset / delete, keyed by `name`), applied under a lock by `ui_store_apply()`, so a stale tab can't revive a deleted key or drop a new one. Whole-list `{value}` writes (pages from before this) get 409. localStorage is only a read fallback when the server is unreachable; it is never merged back.
 
 ## Server and API
 

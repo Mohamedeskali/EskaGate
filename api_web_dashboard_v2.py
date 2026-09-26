@@ -29,6 +29,7 @@ import webbrowser
 import urllib.request
 import urllib.error
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
@@ -2192,28 +2193,75 @@ function escapeHtml(s) {
 const serverStore = { profiles: null, formats: null };
 function readLocal(key) { try { return JSON.parse(localStorage.getItem(key)) || []; } catch (e) { return []; } }
 function writeLocal(key, list) { try { localStorage.setItem(key, JSON.stringify(list)); } catch (e) {} }
-function persist(name, list) {
-  api('/api/store/' + name, { value: list }).catch(e => toast('ما تحفظش على الجهاز', 'bad', e.message));
+/* Tabs send only what they changed (per entry, by name), never the whole list, so a tab with an
+   old copy can't bring back a deleted key or drop one added elsewhere. The server merges and
+   returns the full list, which the tab then takes. Unsent changes wait in outbox and retry. */
+const STORE_KEYS = { profiles: PROFILES_KEY, formats: FORMATS_KEY };
+const outbox = { profiles: [], formats: [] };
+const storeQueue = { profiles: Promise.resolve(), formats: Promise.resolve() };
+function storeOps(before, after, saved) {
+  const old = new Map((before || []).map(x => [x.name, x])), ops = [];
+  for (const x of after) {
+    const b = old.get(x.name); old.delete(x.name);
+    if (!b || x.name === saved) { ops.push({ name: x.name, create: true, set: x }); continue; }
+    const set = {}, unset = Object.keys(b).filter(k => !(k in x));
+    for (const k in x) if (JSON.stringify(x[k]) !== JSON.stringify(b[k])) set[k] = x[k];
+    if (Object.keys(set).length || unset.length) ops.push({ name: x.name, set, unset });
+  }
+  for (const name of old.keys()) ops.push({ name, delete: true });
+  return ops;
+}
+function saveStore(name, list, saved) {
+  outbox[name].push(...storeOps(serverStore[name], list, saved));
+  serverStore[name] = list; writeLocal(STORE_KEYS[name], list);
+  flushStore(name);
+}
+function flushStore(name) {
+  storeQueue[name] = storeQueue[name].then(async () => {
+    const ops = outbox[name].slice();
+    if (!ops.length) return;
+    try {
+      const { value } = await api('/api/store/' + name, { ops });
+      outbox[name].splice(0, ops.length);
+      if (!outbox[name].length) adoptStore(name, value);   // newer local changes still on the way: wait for them
+    } catch (e) {
+      toast('ما تحفظش على الجهاز', 'bad', e.message);
+      setTimeout(() => flushStore(name), 5000);
+    }
+  });
+  return storeQueue[name];
+}
+function adoptStore(name, list) {
+  if (!Array.isArray(list) || JSON.stringify(list) === JSON.stringify(serverStore[name])) return;
+  serverStore[name] = list; writeLocal(STORE_KEYS[name], list);
+  if (name === 'profiles') {
+    refreshProfileSelect(document.getElementById('savedProfiles').value); renderArchive(); updateKeyStats();
+  } else { renderFormatsList(); renderArchive(); refreshCopyDD(); }
+}
+// Picks up changes other tabs made (on load and whenever this tab comes back into view).
+async function refreshStore(name) {
+  await storeQueue[name];
+  if (outbox[name].length) return flushStore(name);
+  try { const { value } = await api('/api/store/' + name); if (!outbox[name].length) adoptStore(name, value || []); }
+  catch (e) {}
 }
 async function initServerStore() {
-  for (const [name, key] of [['profiles', PROFILES_KEY], ['formats', FORMATS_KEY]]) {
-    let server = [];
-    try { server = (await api('/api/store/' + name)).value || []; }
-    catch (e) { serverStore[name] = readLocal(key); continue; }   // server unreachable: keep working locally
-    // Anything only this browser had (older versions saved here) is merged in once, by name.
-    const local = readLocal(key);
-    const names = new Set(server.map(x => x.name));
-    const extra = local.filter(x => x && x.name && !names.has(x.name));
-    serverStore[name] = server.concat(extra);
-    if (extra.length) {
-      persist(name, serverStore[name]);
-      if (name === 'profiles') toast(`تنقلو ${extra.length} مفتاح من هاد المتصفح للبرنامج`, 'ok');
-    }
-    writeLocal(key, serverStore[name]);
+  for (const [name, key] of Object.entries(STORE_KEYS)) {
+    // The browser copy is only a fallback for when the server can't be reached; it is never merged
+    // back in, because it may still hold keys that were deleted since.
+    try { serverStore[name] = (await api('/api/store/' + name)).value || []; writeLocal(key, serverStore[name]); }
+    catch (e) { serverStore[name] = readLocal(key); }
   }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') Object.keys(STORE_KEYS).forEach(refreshStore);
+  });
+  window.addEventListener('beforeunload', e => {
+    if (outbox.profiles.length || outbox.formats.length) { e.preventDefault(); e.returnValue = ''; }
+  });
 }
 function getProfiles() { return JSON.parse(JSON.stringify(serverStore.profiles ?? readLocal(PROFILES_KEY))); }
-function setProfiles(list) { serverStore.profiles = list; writeLocal(PROFILES_KEY, list); persist('profiles', list); }
+// saved: name the user just saved on purpose (added or replaced even if another tab deleted it).
+function setProfiles(list, saved) { saveStore('profiles', list, saved); }
 
 function refreshProfileSelect(selectName) {
   const sel = document.getElementById('savedProfiles');
@@ -2254,7 +2302,7 @@ function saveProfile() {
   const idx = profiles.findIndex(p => p.name === name);
   const entry = { name, ...values };
   if (idx >= 0) profiles[idx] = entry; else profiles.push(entry);
-  setProfiles(profiles);
+  setProfiles(profiles, name);
   refreshProfileSelect(name);
   updateKeyStats();
   toast(`تم حفظ "${name}"`, 'ok');
@@ -2837,7 +2885,7 @@ function updateKeyStats() {
    FORMATS (custom)
    ========================================================================= */
 function getFormats() { return JSON.parse(JSON.stringify(serverStore.formats ?? readLocal(FORMATS_KEY))); }
-function setFormats(list) { serverStore.formats = list; writeLocal(FORMATS_KEY, list); persist('formats', list); }
+function setFormats(list, saved) { saveStore('formats', list, saved); }
 function openFormats() { renderFormatsList(); refreshCopyDD(); document.getElementById('formatsOverlay').classList.add('open'); }
 function closeFormats() { document.getElementById('formatsOverlay').classList.remove('open'); }
 
@@ -2851,7 +2899,7 @@ function saveFormat() {
   const idx = formats.findIndex(f => f.name === name);
   const entry = { name, template };
   if (idx >= 0) formats[idx] = entry; else formats.push(entry);
-  setFormats(formats);
+  setFormats(formats, name);
   document.getElementById('formatName').value = '';
   document.getElementById('formatTemplate').value = '';
   renderFormatsList(); refreshCopyDD();
@@ -3969,11 +4017,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/run":
             return self._run_tester(params)
         if path.startswith("/api/store/"):
+            # Whole-list writes come from a page opened before this version; they would undo other tabs' changes.
+            if "ops" not in params:
+                return self._json(409, {"error": "الصفحة قديمة، دير F5 باش تحفظ."})
             try:
-                ui_store_write(path.rsplit("/", 1)[1], params.get("value"))
+                value = ui_store_apply(path.rsplit("/", 1)[1], params.get("ops"))
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            return self._json(200, {"ok": True})
+            return self._json(200, {"ok": True, "value": value})
         try:
             return self._json(200, self._admin(path, params))
         except ValueError as e:
@@ -4081,6 +4132,41 @@ def ui_store_write(name, value):
     if name not in UI_STORES or not isinstance(value, list):
         raise ValueError("Unknown store or bad value.")
     gateway.write_private(gateway.DATA_DIR / f"ui-{name}.json", json.dumps(value, ensure_ascii=False, indent=1))
+
+
+_ui_store_lock = threading.Lock()
+
+
+def ui_store_apply(name, ops):
+    """Applies one tab's changes, entry by entry (keyed by name), to the current store, so
+    tabs never overwrite each other. Ops: {name, delete: true} | {name, create: true, set}
+    (add or replace the whole entry) | {name, set, unset} (change fields). A field change to
+    an entry that is gone is dropped, so a key deleted in one tab never comes back."""
+    if name not in UI_STORES or not isinstance(ops, list):
+        raise ValueError("Unknown store or bad ops.")
+    with _ui_store_lock:
+        items = [x for x in ui_store_read(name) if isinstance(x, dict)]
+        for op in ops:
+            key = op.get("name") if isinstance(op, dict) else None
+            if not isinstance(key, str) or not key:
+                continue
+            i = next((j for j, x in enumerate(items) if x.get("name") == key), -1)
+            if op.get("delete"):
+                if i >= 0:
+                    items.pop(i)
+            elif op.get("create"):
+                entry = {**(op.get("set") or {}), "name": key}
+                if i >= 0:
+                    items[i] = entry
+                else:
+                    items.append(entry)
+            elif i >= 0:
+                items[i].update({k: v for k, v in (op.get("set") or {}).items() if k != "name"})
+                for k in op.get("unset") or []:
+                    if k != "name":
+                        items[i].pop(k, None)
+        ui_store_write(name, items)
+        return items
 
 
 # The gateway reuses the tester's own request/probe functions.
