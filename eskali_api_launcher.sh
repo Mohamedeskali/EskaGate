@@ -14,7 +14,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 
 notify() {
-  command -v notify-send >/dev/null 2>&1 && notify-send -i "$SCRIPT_DIR/eskali_api_icon.png" "ESKALI_API" "$1"
+  command -v notify-send >/dev/null 2>&1 && notify-send -i "$SCRIPT_DIR/assets/eskali_api_icon.png" "ESKALI_API" "$1"
   echo "$1"
 }
 

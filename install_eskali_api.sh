@@ -19,7 +19,7 @@ fi
 
 chmod +x "$SCRIPT_DIR/eskali_api_launcher.sh"
 mkdir -p "$APPS_DIR" "$ICON_DIR"
-cp "$SCRIPT_DIR/eskali_api_icon.png" "$ICON_DIR/eskali-api.png"
+cp "$SCRIPT_DIR/assets/eskali_api_icon.png" "$ICON_DIR/eskali-api.png"
 
 LAUNCHER="$SCRIPT_DIR/eskali_api_launcher.sh"
 ENTRY="[Desktop Entry]
