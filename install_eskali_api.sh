@@ -46,13 +46,13 @@ Exec=\"$LAUNCHER\" stop
 printf '%s' "$ENTRY" >"$APPS_DIR/$ENTRY_NAME"
 chmod +x "$APPS_DIR/$ENTRY_NAME"
 
-# Shortcut inside the project folder and on the desktop.
-for target in "$SCRIPT_DIR/ESKALI_API.desktop" "$DESKTOP_DIR/ESKALI_API.desktop"; do
-  [[ -d "$(dirname "$target")" ]] || continue
+# Shortcut on the desktop.
+target="$DESKTOP_DIR/ESKALI_API.desktop"
+if [[ -d "$DESKTOP_DIR" ]]; then
   printf '%s' "${ENTRY/Icon=eskali-api/Icon=$ICON_DIR/eskali-api.png}" >"$target"
   chmod +x "$target"
   gio set "$target" metadata::trusted true >/dev/null 2>&1 || true
-done
+fi
 
 update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
 gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true

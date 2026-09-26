@@ -16,10 +16,11 @@ The user writes in Moroccan Darija or Arabic. All UI text is Darija, in an RTL p
 | `gateway.py` | Gateway: provider/key store, `dispatch()` with failover and cooldowns, request/response/stream translation, logs. |
 | `agents.py` | Agent config switching (enable/disable with backup and restore), custom agents, per-agent model filter, icons. |
 | `eskali_api_launcher.sh` | `start` (background + opens browser) / `stop`. PID in `~/.api-test-console/eskali_api.pid`, log in `eskali_api.log`. Port from `ESKALI_API_PORT` (default 8000). |
-| `install_eskali_api.sh` | Installs the `.desktop` entry, icon and desktop shortcut. `--uninstall` removes them. |
+| `install_eskali_api.sh` | Installs the apps-menu `.desktop` entry, icon and desktop shortcut (generated, not stored in the repo). `--uninstall` removes them. |
 | `run-api-dashboard.sh`, `Run API Dashboard.bat`, `create_shortcut.vbs` | Foreground run on Linux / Windows. |
 | `ReadMe.txt` | User-facing instructions (Arabic/Darija). |
-| `backup/` | Manual snapshots taken before each change (`<file>.before-<change>.py`). **This folder is not a git repo, so these are the only history.** |
+
+History is in git. Don't make backup copies of files; commit instead.
 
 ## Data (never commit or print it)
 
@@ -75,7 +76,7 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
 ## Working conventions (user preferences)
 
 - **Extend, don't replace:** keep existing controls, IDs, `onclick` handlers and look; add helpers around them.
-- Snapshot every file you are about to change into `backup/<name>.before-<change>.py` first.
+- Commit to git after each logical change (no `backup/` snapshots).
 - Verify before saying something is done:
   - `python3 -c "import ast; ast.parse(open('api_web_dashboard_v2.py').read())"`
   - Extract the `<script>` blocks from `INDEX_HTML` and run `node --check` on them.
