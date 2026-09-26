@@ -1,4 +1,4 @@
-# ESKALI API
+# EskaGate
 
 A local web app for testing API keys and running a local AI gateway. It uses only the Python 3 standard library, so there is nothing to install beyond Python.
 

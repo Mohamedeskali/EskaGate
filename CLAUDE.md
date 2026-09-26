@@ -1,4 +1,4 @@
-# ESKALI API — API key test console + local AI gateway
+# EskaGate — API key test console + local AI gateway
 
 Local web app (Python standard library only, no pip installs) that:
 1. **Tests API keys**: finds a key's models (`/models`, `/v1/models`), sends a test prompt to each, and streams results live to the page.

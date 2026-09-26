@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs ESKALI_API as an application (apps menu + desktop icon).
+# Installs EskaGate as an application (apps menu + desktop icon).
 # Run again after moving this folder. Use "--uninstall" to remove it.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   "$SCRIPT_DIR/eskali_api_launcher.sh" stop >/dev/null 2>&1 || true
   rm -f "$APPS_DIR/$ENTRY_NAME" "$DESKTOP_DIR/ESKALI_API.desktop" "$ICON_DIR/eskali-api.png"
   update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
-  echo "تحيد ESKALI_API من التطبيقات."
+  echo "تحيد EskaGate من التطبيقات."
   exit 0
 fi
 
@@ -25,7 +25,7 @@ LAUNCHER="$SCRIPT_DIR/eskali_api_launcher.sh"
 ENTRY="[Desktop Entry]
 Type=Application
 Version=1.0
-Name=ESKALI_API
+Name=EskaGate
 Comment=لوحة اختبار المفاتيح و AI Gateway المحلي
 Comment[en]=API test console and local AI gateway
 Exec=\"$LAUNCHER\" start
@@ -38,8 +38,8 @@ StartupNotify=false
 Actions=stop;
 
 [Desktop Action stop]
-Name=إيقاف ESKALI_API
-Name[en]=Stop ESKALI_API
+Name=إيقاف EskaGate
+Name[en]=Stop EskaGate
 Exec=\"$LAUNCHER\" stop
 "
 
@@ -57,7 +57,7 @@ fi
 update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
 gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 
-echo "تثبت ESKALI_API ✔"
-echo "  - غادي تلقاه فقائمة التطبيقات (Show Apps) باسم ESKALI_API"
+echo "تثبت EskaGate ✔"
+echo "  - غادي تلقاه فقائمة التطبيقات (Show Apps) باسم EskaGate"
 echo "  - أيقونة على سطح المكتب: $DESKTOP_DIR/ESKALI_API.desktop"
-echo "  - باش توقفو: كليك يمين على الأيقونة ← إيقاف ESKALI_API"
+echo "  - باش توقفو: كليك يمين على الأيقونة ← إيقاف EskaGate"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ESKALI_API app launcher: starts the dashboard in the background (if not
+# EskaGate app launcher: starts the dashboard in the background (if not
 # already running) and opens it in the browser. Use "stop" to shut it down.
 set -uo pipefail
 
@@ -14,7 +14,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 
 notify() {
-  command -v notify-send >/dev/null 2>&1 && notify-send -i "$SCRIPT_DIR/assets/eskali_api_icon.png" "ESKALI_API" "$1"
+  command -v notify-send >/dev/null 2>&1 && notify-send -i "$SCRIPT_DIR/assets/eskali_api_icon.png" "EskaGate" "$1"
   echo "$1"
 }
 
@@ -31,7 +31,7 @@ is_dashboard() {
   "$PYTHON_BIN" - "$URL" <<'EOF' >/dev/null 2>&1
 import sys, urllib.request
 body = urllib.request.urlopen(sys.argv[1], timeout=2).read(4096).decode("utf-8", "ignore")
-sys.exit(0 if ("ESKALI API" in body or "API Monitor Console" in body) else 1)
+sys.exit(0 if ("EskaGate" in body or "ESKALI API" in body or "API Monitor Console" in body) else 1)
 EOF
 }
 
@@ -39,12 +39,12 @@ case "${1:-start}" in
   stop)
     if is_running; then
       kill "$(cat "$PID_FILE")" && rm -f "$PID_FILE"
-      notify "توقف ESKALI_API."
+      notify "توقف EskaGate."
     elif is_dashboard; then
-      notify "ESKALI_API شاعل من الطرفية، وقفو تما بـ Ctrl+C."
+      notify "EskaGate شاعل من الطرفية، وقفو تما بـ Ctrl+C."
     else
       rm -f "$PID_FILE"
-      notify "ESKALI_API ماشي شاعل."
+      notify "EskaGate ماشي شاعل."
     fi
     exit 0
     ;;
@@ -67,7 +67,7 @@ if ! is_running && ! is_dashboard; then
   for _ in $(seq 1 50); do
     port_open && break
     if ! is_running; then
-      notify "ESKALI_API ما بغاش يخدم. شوف: $LOG_FILE"
+      notify "EskaGate ما بغاش يخدم. شوف: $LOG_FILE"
       rm -f "$PID_FILE"
       exit 1
     fi
