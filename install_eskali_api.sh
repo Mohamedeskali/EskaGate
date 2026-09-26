@@ -30,7 +30,7 @@ Comment=لوحة اختبار المفاتيح و AI Gateway المحلي
 Comment[en]=API test console and local AI gateway
 Exec=\"$LAUNCHER\" start
 Path=$SCRIPT_DIR
-Icon=eskali-api
+Icon=$ICON_DIR/eskali-api.png
 Terminal=false
 Categories=Development;
 Keywords=api;gateway;eskali;dashboard;
@@ -49,7 +49,7 @@ chmod +x "$APPS_DIR/$ENTRY_NAME"
 # Shortcut on the desktop.
 target="$DESKTOP_DIR/ESKALI_API.desktop"
 if [[ -d "$DESKTOP_DIR" ]]; then
-  printf '%s' "${ENTRY/Icon=eskali-api/Icon=$ICON_DIR/eskali-api.png}" >"$target"
+  printf '%s' "$ENTRY" >"$target"
   chmod +x "$target"
   gio set "$target" metadata::trusted true >/dev/null 2>&1 || true
 fi
