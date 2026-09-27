@@ -19,6 +19,9 @@ The user writes in Moroccan Darija or Arabic. All UI text is Darija, in an RTL p
 | `install_eskali_api.sh` | Installs the apps-menu `.desktop` entry, icon and desktop shortcut (generated, not stored in the repo). `--uninstall` removes them. |
 | `run-api-dashboard.sh`, `Run API Dashboard.bat`, `create_shortcut.vbs` | Foreground run on Linux / Windows. |
 | `README.md` | User-facing overview and run instructions (Linux / Windows). |
+| `get.sh` | One-line Ubuntu install/update (`curl … | bash`): checks python3 ≥3.8 and git (prints the apt command, never sudo), clones or `git pull --ff-only` into `~/EskaGate` (`ESKAGATE_DIR`, `ESKAGATE_REPO` override for tests), runs the installer, restarts a copy running from that folder after an update, starts the app. |
+| `get.ps1` | One-line Windows install/update (`irm … | iex`): finds Python 3.8+ (winget installs 3.12 if missing), mirrors the GitHub ZIP into `%LOCALAPPDATA%\EskaGate`, writes `EskaGate.cmd` with the exact python path, Start Menu + Desktop shortcuts. ASCII-only, no `exit`, 5.1-compatible syntax. Not yet run on real Windows. |
+| `docs/screenshots/` | README screenshots, taken from a demo copy with fake data (own `HOME`/`API_CONSOLE_HOME`/port). Never shoot the real instance. |
 | `assets/` | `eskali_api_icon.png` (Linux app + notifications), `api_dashboard_icon.ico` (Windows shortcut). The page favicon is inline in `INDEX_HTML`. |
 
 History is in git. Don't make backup copies of files; commit instead.
