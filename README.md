@@ -31,7 +31,7 @@ irm https://raw.githubusercontent.com/Mohamedeskali/EskaGate/main/get.ps1 | iex
 
 If Python 3.8 or newer is missing, it installs Python 3.12 with `winget`, or explains how to install it from python.org. It installs to `%LOCALAPPDATA%\EskaGate` (no git needed), adds Start Menu and Desktop shortcuts, and starts EskaGate in its own window. Closing that window stops the app.
 
-Run the same command again to update. Your keys and settings are kept.
+Run the same command again to update (see [Update](#update)). To remove EskaGate, see [Uninstall](#uninstall).
 
 ## Screenshots
 
@@ -104,12 +104,70 @@ The app runs in the background and logs to `~/.api-test-console/eskali_api.log`.
 
 To use a different port, change `8000` in `Run API Dashboard.bat`.
 
+## Update
+
+Run the one-line install command again. It updates EskaGate to the latest version and keeps your keys and settings:
+
+- **Ubuntu:** updates `~/EskaGate` with `git pull` and restarts EskaGate if it was running from there.
+- **Windows:** replaces the files in `%LOCALAPPDATA%\EskaGate` and restarts EskaGate if it was running from there.
+
+With a manual install, run `git pull` in the project folder, or download the ZIP again and replace the files. Then restart EskaGate.
+
 ## Uninstall
 
-- **Ubuntu (one-line install):** run `~/EskaGate/install_eskali_api.sh --uninstall`, then delete `~/EskaGate`.
-- **Windows (one-line install):** delete the EskaGate shortcuts from the Start Menu and the Desktop, then delete `%LOCALAPPDATA%\EskaGate`.
+**Ubuntu:**
 
-This leaves your keys and settings in `.api-test-console`. Delete that folder too if you want to remove them.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Mohamedeskali/EskaGate/main/get.sh | bash -s -- --uninstall
+```
+
+**Windows** (in PowerShell):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Mohamedeskali/EskaGate/main/get.ps1))) -Uninstall
+```
+
+Both commands stop EskaGate, remove its shortcuts (apps menu and desktop, or Start Menu and Desktop) and delete the app folder (`~/EskaGate` or `%LOCALAPPDATA%\EskaGate`).
+
+Your keys and settings stay in `~/.api-test-console` (on Windows `%USERPROFILE%\.api-test-console`). They are only deleted if you delete that folder yourself. On Ubuntu:
+
+```bash
+rm -rf ~/.api-test-console
+```
+
+For a manual install on Linux, run `./install_eskali_api.sh --uninstall` in the project folder, then delete the folder.
+
+## Troubleshooting
+
+**Python is not found or not on PATH**
+
+- **Ubuntu:** run `sudo apt install python3`, then check with `python3 --version`. It must be 3.8 or newer.
+- **Windows:** `'python' is not recognized`, or the Microsoft Store opens when you type `python`, means Python is not installed or not on PATH.
+  - Install it from [python.org](https://www.python.org/downloads/windows/) with **"Add python.exe to PATH"** ticked.
+  - If Python is already installed without PATH: run its installer again, choose **Modify**, click **Next**, tick **"Add Python to environment variables"** and click **Install**.
+  - To stop the Store from opening: **Settings → Apps → Advanced app settings → App execution aliases**, and turn off `python.exe` and `python3.exe`.
+  - Open a new terminal afterwards. The one-line installer finds Python even when it is not on PATH.
+
+**Port 8000 is already in use**
+
+EskaGate says the port is used by another program, or you see `Address already in use` (Linux) or `WinError 10048` (Windows).
+
+- Find out what uses it: `ss -ltnp | grep :8000` on Linux, `netstat -ano | findstr :8000` on Windows. Stop that program, or run EskaGate on another port:
+  - **Ubuntu:** `ESKALI_API_PORT=8080 ~/EskaGate/eskali_api_launcher.sh start`, or `./run-api-dashboard.sh 8080` in a terminal. The apps-menu icon always uses port 8000.
+  - **Windows:** run `$env:ESKALI_API_PORT = 8080` and then the one-line install command in the same PowerShell window. The shortcuts then use port 8080. You can also change `--port 8000` in `%LOCALAPPDATA%\EskaGate\EskaGate.cmd`, or `8000` in `Run API Dashboard.bat` for a manual install.
+- The gateway addresses change with the port, for example `http://127.0.0.1:8080/v1`. In the Agents tab, press Enable again for each agent that uses the gateway.
+
+**Windows blocks the script**
+
+- The one-line `irm … | iex` command does not run a script file, so the execution policy does not block it.
+- If you downloaded `get.ps1` and running `.\get.ps1` says *running scripts is disabled on this system*, run it once with:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\get.ps1
+  ```
+
+  Or allow local scripts for your user with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, then run `Unblock-File .\get.ps1`.
+- If Windows shows *Windows protected your PC* for `Run API Dashboard.bat` or `create_shortcut.vbs` from a downloaded ZIP, click **More info → Run anyway**. You can also avoid it: before extracting, right-click the ZIP, choose **Properties** and tick **Unblock**.
 
 ## Files
 
@@ -124,3 +182,8 @@ This leaves your keys and settings in `.api-test-console`. Delete that folder to
 | `Run API Dashboard.bat`, `create_shortcut.vbs` | Windows: run and desktop shortcut |
 | `assets/` | App icons (`.png` for Linux, `.ico` for Windows) |
 | `docs/screenshots/` | Screenshots used in this README |
+| `LICENSE` | MIT license |
+
+## License
+
+EskaGate is released under the [MIT License](LICENSE).
