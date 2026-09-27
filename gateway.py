@@ -15,6 +15,7 @@ Local AI Gateway — standard library only.
 
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -342,6 +343,107 @@ def mark_key(provider, key, ok, kind=None, error="", retry_after=None):
 NO_MAX_TOKENS = set()
 
 
+# ---------------------------------------------------------------------------
+# Reasoning effort: an agent's model can carry "@<level>" (e.g. "gpt-5@high").
+# The gateway strips it for routing and writes the matching upstream parameter.
+# ---------------------------------------------------------------------------
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# (provider id, model, level) that rejected the effort parameter: sent without it.
+NO_EFFORT = set()
+EXTRA_MODELS = lambda: []          # agents.py adds the "@level" names its agents use to /v1/models
+
+_REASONING_RE = re.compile(
+    r"(^|[/:_-])o[134]($|[-_.])|gpt-5(?!(\.\d+)?-chat)|gpt-oss|claude-(3[-.]7|.*(opus|sonnet|haiku)-[4-9]|[4-9])"
+    r"|claude-(fable|mythos)|gemini-(2\.5|[3-9])|deepseek-(r1|reasoner|v3\.[1-9]|v[4-9])|qwq|qwen3|grok-(3-mini|[4-9])"
+    r"|glm-(4\.[5-9]|[5-9])|kimi-k2[.-]?(thinking|[5-9])|minimax-m[1-9]|magistral|ernie-.*thinking|seed-.*thinking"
+    r"|think|reason|(^|[/-])r1($|[-:])")
+_NOT_REASONING_RE = re.compile(r"non-?reasoning|no-?think|chat-latest|embed|tts|whisper|image|audio")
+
+
+def split_effort(model):
+    """("gpt-5@high") -> ("gpt-5", "high"); names without a known level come back unchanged."""
+    model = str(model or "")
+    base, sep, level = model.rpartition("@")
+    return (base, level) if sep and base and level in EFFORTS else (model, "")
+
+
+def with_effort(model, level):
+    return f"{model}@{level}" if level in EFFORTS else model
+
+
+def supports_reasoning(model):
+    """Best guess from the name: providers' /models lists don't say which models think."""
+    name = str(model or "").lower()
+    if _NOT_REASONING_RE.search(name):
+        return False
+    if "instruct" in name and not re.search(r"think|reason", name):
+        return False                        # e.g. qwen3-*-instruct-2507 is the non-thinking build
+    return bool(_REASONING_RE.search(name))
+
+
+# Claude models that take adaptive thinking + output_config.effort (budget_tokens is refused there).
+_ADAPTIVE_RE = re.compile(r"(opus|sonnet)-4[-.][6-9]|claude-(opus-|sonnet-|haiku-)?[5-9]|fable|mythos")
+_BUDGET = {"minimal": 1024, "low": 4000, "medium": 10000, "high": 20000, "xhigh": 32000, "max": 48000}
+
+
+def _needs_thinking_block(body):
+    """Anthropic refuses thinking when the last assistant turn used a tool without a thinking block
+    (translated histories lose them), or when a tool call is forced."""
+    if (body.get("tool_choice") or {}).get("type") in ("any", "tool"):
+        return True
+    for m in reversed(body.get("messages") or []):
+        if m.get("role") == "assistant":
+            c = m.get("content")
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_use" for b in c):
+                first = c[0] if c and isinstance(c[0], dict) else {}
+                return first.get("type") not in ("thinking", "redacted_thinking")
+            return False
+    return False
+
+
+def apply_effort(body, up_fmt, provider, model, level):
+    """Write `level` into an upstream request body, in place (the client's own setting is replaced)."""
+    if up_fmt == "anthropic":
+        body.pop("thinking", None)
+        oc = dict(body.get("output_config") or {})
+        oc.pop("effort", None)
+        name = model.lower()
+        blocked = _needs_thinking_block(body)
+        if _ADAPTIVE_RE.search(name):
+            eff = {"none": "low", "minimal": "low"}.get(level, level)
+            if eff == "xhigh" and re.search(r"4[-.]6", name):
+                eff = "high"                # 4.6 has no xhigh
+            oc["effort"] = eff
+            if level != "none" and not blocked:
+                body["thinking"] = {"type": "adaptive"}
+        elif level != "none" and not blocked:
+            budget = _BUDGET[level]
+            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            if int(body.get("max_tokens") or 0) <= budget:
+                body["max_tokens"] = budget + 8000
+        if oc:
+            body["output_config"] = oc
+        else:
+            body.pop("output_config", None)
+        if body.get("thinking"):
+            for k in ("temperature", "top_p", "top_k"):   # not allowed together with thinking
+                body.pop(k, None)
+    else:
+        body.pop("reasoning_effort", None)
+        body.pop("reasoning", None)
+        eff = "xhigh" if level == "max" else level
+        if "openrouter.ai" in provider.get("base_url", "").lower():
+            body["reasoning"] = {"effort": eff}
+        else:
+            body["reasoning_effort"] = eff
+    return body
+
+
+def _effort_rejected(err):
+    text = short_error(err).lower()
+    return any(w in text for w in ("reasoning", "effort", "thinking", "output_config"))
+
+
 class GatewayError(Exception):
     def __init__(self, status, message, kind="api_error"):
         super().__init__(message)
@@ -354,7 +456,7 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
     Returns (provider, key, upstream_fmt, upstream_model, response, attempts).
     Only failures that happen before any byte reaches the client are retried.
     """
-    model = str(body.get("model") or "")
+    model, level = split_effort(body.get("model"))
     if not model:
         raise GatewayError(400, "The request has no model.", "invalid_request_error")
     targets = resolve_targets(model)
@@ -380,9 +482,18 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
         url = upstream_url(provider, up_fmt)
         if (provider["id"], upstream_model) in NO_MAX_TOKENS:
             up_body.pop("max_tokens", None)
+        plain_body = up_body
+        effort_on = bool(level) and (provider["id"], upstream_model, level) not in NO_EFFORT
+        if effort_on:
+            up_body = apply_effort(json.loads(json.dumps(up_body)), up_fmt, provider, upstream_model, level)
         for key in ordered_keys(provider):
             headers = upstream_headers(provider, key["key"], incoming_headers)
             status, resp, err = open_upstream(url, headers, up_body, timeout)
+            if status == 400 and effort_on and _effort_rejected(err):
+                # This model/provider doesn't take that thinking level: send the request as it was.
+                NO_EFFORT.add((provider["id"], upstream_model, level))
+                effort_on, up_body = False, plain_body
+                status, resp, err = open_upstream(url, headers, up_body, timeout)
             if status == 400 and up_fmt == "openai" and "max_tokens" in short_error(err).lower() \
                     and "max_tokens" in up_body:
                 # Agents like Claude Code ask for very large max_tokens that many
@@ -586,10 +697,12 @@ def openai_to_anthropic_response(res, model):
 
 
 def anthropic_to_openai_response(res, model):
-    text, tool_calls = "", []
+    text, thinking, tool_calls = "", "", []
     for b in res.get("content") or []:
         if b.get("type") == "text":
             text += b.get("text", "")
+        elif b.get("type") == "thinking":
+            thinking += b.get("thinking", "")
         elif b.get("type") == "tool_use":
             tool_calls.append({"id": b.get("id"), "type": "function",
                                "function": {"name": b.get("name"),
@@ -597,6 +710,8 @@ def anthropic_to_openai_response(res, model):
     msg = {"role": "assistant", "content": text or (None if tool_calls else "")}
     if tool_calls:
         msg["tool_calls"] = tool_calls
+    if thinking:
+        msg["reasoning_content"] = thinking          # the field OpenAI-style clients show as reasoning
     usage = res.get("usage") or {}
     inp, outp = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
     return {"id": res.get("id") or new_id("chatcmpl-"), "object": "chat.completion", "created": int(time.time()),
@@ -751,6 +866,8 @@ def anthropic_stream_to_openai(resp, model, usage):
             d = obj.get("delta") or {}
             if d.get("type") == "text_delta":
                 yield chunk({"content": d.get("text", "")})
+            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                yield chunk({"reasoning_content": d["thinking"]})
             elif d.get("type") == "input_json_delta" and obj.get("index") in block_is_tool:
                 yield chunk({"tool_calls": [{"index": block_is_tool[obj["index"]],
                                              "function": {"arguments": d.get("partial_json", "")}}]})
@@ -832,6 +949,10 @@ def handle(handler, method):
                 if not any(d["id"] == m for d in data):
                     data.append({"id": m, "object": "model", "type": "model", "created": now,
                                  "owned_by": p["name"], "display_name": m})
+        for m in EXTRA_MODELS():
+            if not any(d["id"] == m for d in data):
+                data.append({"id": m, "object": "model", "type": "model", "created": now,
+                             "owned_by": "gateway", "display_name": m})
         return _send_json(handler, 200, {"object": "list", "data": data, "has_more": False,
                                          "first_id": data[0]["id"] if data else None,
                                          "last_id": data[-1]["id"] if data else None})

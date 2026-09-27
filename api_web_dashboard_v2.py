@@ -1614,6 +1614,10 @@ INDEX_HTML = r"""
   .mdd-foot button { background:none; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:3px 8px; font:inherit; font-size:11px; cursor:pointer; }
   .mdd-foot button:hover { border-color:var(--accent); color:var(--accent); }
   .agent-filter-info { font-size:11px; color:var(--accent); font-weight:700; }
+  .effort-row { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+  .effort-row span { white-space:nowrap; }
+  .agent-card .effort-row select { font-family:inherit; }
+  .effort-na { font-size:11px; color:var(--faint); }
 
   @media (max-width: 700px) { .key-row { grid-template-columns: 22px 1fr auto; } .key-row .err, .key-row .st { grid-column: 2 / 4; } }
 </style>
@@ -3577,6 +3581,7 @@ let iconTarget = null;
 async function loadAgents() {
   let r;
   try { r = await api('/api/agents'); } catch (e) { toast('ما قدرتش نقرا الوكلاء', 'bad', e.message); return; }
+  reasoningModels = new Set(r.reasoning_models || []);
   renderAgents(r.agents, r.models);
 }
 function agentIconHtml(a) {
@@ -3639,6 +3644,7 @@ function renderAgents(list, models) {
               <button type="button" onclick="markShownModels(false)" title="حيد العلامة من الموديلات لي ظاهرين">☐ حيد</button></div>
           </div>
         </div>
+        <div id="effortRow-${a.id}">${effortSelectHtml(a.id, cur, a.installed && models.length)}</div>
         ${filtered ? `<div class="agent-filter-info">☑ كيبانو غير ${shown.length} من ${models.length} موديل فهاد الوكيل</div>` : ''}
       </div>
       <div class="row">
@@ -3652,6 +3658,32 @@ function renderAgents(list, models) {
 function modelMatches(m, query) {
   const name = m.toLowerCase();
   return query.toLowerCase().split(/\s+/).filter(Boolean).every(w => name.includes(w));
+}
+/* ---- thinking level: sent as "model@level", the gateway turns it into the provider's own parameter ---- */
+const EFFORT_LEVELS = [['', 'افتراضي (الوكيل كيختار)'], ['none', 'بلا تفكير (none)'], ['minimal', 'أدنى (minimal)'],
+  ['low', 'خفيف (low)'], ['medium', 'متوسط (medium)'], ['high', 'عالي (high)'], ['xhigh', 'عالي بزاف (xhigh)'], ['max', 'أقصى (max)']];
+let reasoningModels = new Set();  // models whose name says they can think (from the server)
+let agentEffortPick = {};         // level chosen in the select, kept across re-renders
+function agentEffort(id) {
+  if (id in agentEffortPick) return agentEffortPick[id];
+  const a = agentsCache.find(x => x.id === id);
+  return (a && a.effort) || '';
+}
+function effortSelectHtml(id, model, usable) {
+  if (!model) return '';
+  if (!reasoningModels.has(model))
+    return '<div class="effort-na">🧠 هاد الموديل ما باينش كيدعم مستوى التفكير</div>';
+  const cur = agentEffort(id);
+  return `<label class="effort-row" title="الـ gateway كيبدلو للپاراميتر ديال المزود (reasoning_effort / thinking). إلا المزود رفضو، كيتبعث الطلب بلا بيه.">
+    <span>🧠 التفكير</span>
+    <select id="agentEffort-${id}" ${usable ? '' : 'disabled'} onchange="agentEffortPick['${esc(id)}'] = this.value">
+      ${EFFORT_LEVELS.map(([v, t]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${t}</option>`).join('')}
+    </select></label>`;
+}
+// The level to send: none when the chosen model doesn't support thinking.
+function effortValue(id) {
+  const el = document.getElementById('agentEffort-' + id);
+  return el ? el.value : '';
 }
 /* ---- model dropdown: click → search; click a name = the agent's model; ☑ = shows in the agent ---- */
 let agentModelsAll = [];
@@ -3696,6 +3728,7 @@ function setDropdownValue(m) {
   document.getElementById('agentModel-' + mdd.id).value = m;
   document.getElementById('mddVal-' + mdd.id).textContent = m;
   agentPick[mdd.id] = m;
+  document.getElementById('effortRow-' + mdd.id).innerHTML = effortSelectHtml(mdd.id, m, true);
 }
 // When models are marked, the agent's model has to be one of them.
 function keepValueInMarked() {
@@ -3737,7 +3770,8 @@ async function closeModelDropdown() {
   if (!dirty) return;
   const models = agentModelsAll.filter(m => marked.has(m));
   try {
-    const r = await api('/api/agents/models', { agent: id, models, model: document.getElementById('agentModel-' + id).value });
+    const r = await api('/api/agents/models', { agent: id, models, model: document.getElementById('agentModel-' + id).value,
+      effort: effortValue(id) });
     renderAgents(r.agents, agentModelsAll);
     const a = r.agents.find(x => x.id === id);
     toast(models.length ? `☑ كيبانو ${models.length} موديل فـ ${a ? a.name : 'الوكيل'}` : 'رجعو يبانو جميع الموديلات', 'ok',
@@ -3751,7 +3785,7 @@ document.addEventListener('mousedown', e => {
 async function enableAgent(id) {
   const model = document.getElementById('agentModel-' + id).value;
   try {
-    const r = await api('/api/agents/enable', { agent: id, model });
+    const r = await api('/api/agents/enable', { agent: id, model, effort: effortValue(id) });
     renderAgents(r.agents, gwState ? gwState.models : []);
     toast('تفعّل. عاود شغّل الوكيل باش ياخد الإعدادات.', 'ok');
   } catch (e) { toast('ما تفعّلش', 'bad', e.message); }
@@ -3970,8 +4004,10 @@ class Handler(BaseHTTPRequestHandler):
     def _state(self):
         st = gateway.store()
         root = self._gateway_root()
+        models = st.all_models()
         return {"local_key": st.local_key, "root": root, "openai_base": root + "/v1",
-                "anthropic_base": root, "providers": st.public_view(), "models": st.all_models(),
+                "anthropic_base": root, "providers": st.public_view(), "models": models,
+                "reasoning_models": [m for m in models if gateway.supports_reasoning(m)],
                 "data_dir": str(gateway.DATA_DIR)}
 
     # ---- routes ------------------------------------------------------------
@@ -3998,8 +4034,9 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/store/") and path.rsplit("/", 1)[1] in UI_STORES:
                 return self._json(200, {"value": ui_store_read(path.rsplit("/", 1)[1])})
             if path == "/api/agents":
-                return self._json(200, {"agents": agents.list_agents(self._gateway_root()),
-                                        "models": gateway.store().all_models()})
+                models = gateway.store().all_models()
+                return self._json(200, {"agents": agents.list_agents(self._gateway_root()), "models": models,
+                                        "reasoning_models": [m for m in models if gateway.supports_reasoning(m)]})
         self.send_error(404, "Not found")
 
     def do_POST(self):
@@ -4057,10 +4094,10 @@ class Handler(BaseHTTPRequestHandler):
             gateway.clear_logs()
             return {"ok": True}
         elif path == "/api/agents/enable":
-            agents.enable(p.get("agent"), root, p.get("model"))
+            agents.enable(p.get("agent"), root, p.get("model"), p.get("effort") or "")
             return {"agents": agents.list_agents(root)}
         elif path == "/api/agents/models":
-            agents.set_model_filter(p.get("agent"), p.get("models"), root, p.get("model"))
+            agents.set_model_filter(p.get("agent"), p.get("models"), root, p.get("model"), p.get("effort"))
             return {"agents": agents.list_agents(root)}
         elif path == "/api/agents/disable":
             restored = agents.disable(p.get("agent"))

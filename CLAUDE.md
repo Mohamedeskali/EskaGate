@@ -77,6 +77,7 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
   - A floating ⬆ button (`#toTop`) returns to the top.
 - **Key name link:** the card title links to the key's "المصدر" (source) field when it is an http(s) URL or a bare domain (`sourceUrl()`). It opens in a new tab and rejects other schemes.
 - **Copy config menu** on each key: opencode / pi agent (`piagent`) / hermes / custom formats / custom template.
+- **Thinking level per agent:** under the model picker, a 🧠 select (`effortSelectHtml()`) shows only for models that `gateway.supports_reasoning()` guesses from the name (sent to the page as `reasoning_models`). The level travels in the model name written to the agent config (`gpt-5@high`, levels in `gateway.EFFORTS`). `dispatch()` strips it for routing and `apply_effort()` writes the upstream parameter: `reasoning_effort` (OpenRouter: `reasoning.effort`), or for Anthropic `thinking` adaptive + `output_config.effort` (4.6+/5 family) or `budget_tokens` (older). A 400 that names the parameter is retried without it and remembered in `NO_EFFORT`. Anthropic thinking comes back to OpenAI clients as `reasoning_content`.
 
 ## Working conventions (user preferences)
 
