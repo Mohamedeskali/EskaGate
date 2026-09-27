@@ -15,6 +15,9 @@ The user writes in Moroccan Darija or Arabic. All UI text is Darija, in an RTL p
 | `api_web_dashboard_v2.py` | HTTP server (`ThreadingHTTPServer`), tester logic, and the whole page (HTML/CSS/JS) in one raw string `INDEX_HTML = r"""..."""`. ~4100 lines. |
 | `gateway.py` | Gateway: provider/key store, `dispatch()` with failover and cooldowns, request/response/stream translation, logs. |
 | `agents.py` | Agent config switching (enable/disable with backup and restore), custom agents, per-agent model filter, icons. |
+| `alerts.py` | Telegram alerts. Sets `gateway.ON_EVENT` (gateway never imports it); events `key_failed`, `provider_down`, `key_ok`, `request` (start/end, for the idle check). Dedup per (provider or `agent:<name>`, cause) for `DEDUP` = 300 s. Sending runs on a worker thread. `ESKAGATE_TELEGRAM_API` overrides the API base for tests. |
+| `phone.py` | Phone access: a second `ThreadingHTTPServer` on the private LAN IP (same port, `server.lan = True`), started/stopped from the page. Token in memory, rotated on stop; off after every restart. |
+| `qr.py` | Stdlib QR encoder (byte mode, level M, versions 1-10) returning SVG. Verified with a zxing decoder over all masks and versions. |
 | `eskali_api_launcher.sh` | `start` (background + opens browser) / `stop`. PID in `~/.api-test-console/eskali_api.pid`, log in `eskali_api.log`. Port from `ESKALI_API_PORT` (default 8000). |
 | `install_eskali_api.sh` | Installs the apps-menu `.desktop` entry, icon and desktop shortcut (generated, not stored in the repo). `--uninstall` removes them. |
 | `run-api-dashboard.sh`, `Run API Dashboard.bat`, `create_shortcut.vbs` | Foreground run on Linux / Windows. |
@@ -41,11 +44,13 @@ Everything lives in `~/.api-test-console/` (override with `API_CONSOLE_HOME`): t
 | `agents-custom.json` | Custom agent specs and icons |
 | `agent-models.json` | Per-agent model filter |
 | `agent-backups/` | Copies of agent configs taken before Enable |
+| `telegram.json` | Telegram bot token, chat ID, enabled, idle minutes (shown masked in the page) |
 
 Tabs save profiles/formats as per-entry ops (`POST /api/store/<name>` with `{ops}`: create / set+unset / delete, keyed by `name`), applied under a lock by `ui_store_apply()`, so a stale tab can't revive a deleted key or drop a new one. Whole-list `{value}` writes (pages from before this) get 409. localStorage is only a read fallback when the server is unreachable; it is never merged back.
 
 ## Server and API
 
+- Phone access (LAN listener): every request, including `/v1/*`, first passes `Handler._lan_gate()`. `?token=` on a GET sets the `eg_phone` cookie (HttpOnly, SameSite=Lax) and redirects without it. No valid token gives 401, and a non-private client IP gives 403. On that listener `_admin_ok()` accepts only the LAN IP as Host/Origin. Routes: `GET /api/phone`, `POST /api/phone/{start,stop}`; Telegram: `GET /api/telegram`, `POST /api/telegram/{save,test,chat-id}`.
 - Page API: `/api/*`. Requests must carry the header `X-Console: 1`, and a non-localhost `Origin` is rejected with 403. A plain `curl` gets `{"error":"Forbidden"}`, which is expected and not a bug. To inspect state from the shell, import the modules directly, e.g. `python3 -c "import agents; print(agents.list_agents('http://127.0.0.1:8000'))"`.
 - Routes: `/api/run` (NDJSON stream), `/api/store/{profiles,formats}`, `/api/providers/{save,delete,import,test,keys/add,keys/check,keys/delete}`, `/api/gateway/{state,regenerate}`, `/api/logs[/clear]`, `/api/agents[/enable,/disable,/models,/custom/save,/custom/delete,/icon]`.
 - Gateway endpoints on the same port: `POST /v1/chat/completions` (OpenAI), `POST /v1/messages` (+ `/count_tokens`, Anthropic), `GET /v1/models`. OpenAI clients use `http://127.0.0.1:8000/v1`; Anthropic clients use the bare root.
@@ -78,6 +83,8 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
 - **Key name link:** the card title links to the key's "المصدر" (source) field when it is an http(s) URL or a bare domain (`sourceUrl()`). It opens in a new tab and rejects other schemes.
 - **Copy config menu** on each key: opencode / pi agent (`piagent`) / hermes / custom formats / custom template.
 - **Thinking level per agent:** under the model picker, a 🧠 select (`effortSelectHtml()`) shows only for models that `gateway.supports_reasoning()` guesses from the name (sent to the page as `reasoning_models`). The level travels in the model name written to the agent config (`gpt-5@high`, levels in `gateway.EFFORTS`). `dispatch()` strips it for routing and `apply_effort()` writes the upstream parameter: `reasoning_effort` (OpenRouter: `reasoning.effort`), or for Anthropic `thinking` adaptive + `output_config.effort` (4.6+/5 family) or `budget_tokens` (older). A 400 that names the parameter is retried without it and remembered in `NO_EFFORT`. Anthropic thinking comes back to OpenAI clients as `reasoning_content`.
+
+- **Phone layout (≤520px):** compact header (title hidden ≤400px), 2-column stats, key/agent grids use `minmax(0, 1fr)`. Headless Chrome can't go below ~500px wide, so check phone widths through the DevTools protocol (`Emulation.setDeviceMetricsOverride`, driven from Node's built-in WebSocket) and make sure `document.documentElement.scrollWidth` equals the width.
 
 ## Working conventions (user preferences)
 

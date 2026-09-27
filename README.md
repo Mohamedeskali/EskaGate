@@ -8,6 +8,8 @@ A local web app for testing API keys and running a local AI gateway. It uses onl
   - OpenAI clients: `http://127.0.0.1:8000/v1`
   - Anthropic clients: `http://127.0.0.1:8000`
 - **Coding agents:** switches Claude Code, opencode, pi, Hermes or a custom agent onto the gateway and restores their original config afterwards.
+- **Phone access:** opens the whole site on your phone over the home Wi-Fi with a QR code (📱 button). Off by default.
+- **Telegram alerts:** a message when a key or a provider goes down, an agent goes quiet, or things recover.
 
 The UI is in Moroccan Darija. Keys and settings are stored in `~/.api-test-console/` (on Windows `%USERPROFILE%\.api-test-console\`), which only your user can read.
 
@@ -104,6 +106,45 @@ The app runs in the background and logs to `~/.api-test-console/eskali_api.log`.
 
 To use a different port, change `8000` in `Run API Dashboard.bat`.
 
+## Open it on your phone
+
+1. Press **📱** in the top bar. EskaGate starts listening on your PC's home-network address and shows a QR code.
+2. Scan the QR code with the phone camera. The phone must be on the same Wi-Fi as the PC, not a guest network.
+3. The phone opens the full site: test, keys, providers, gateway and agents.
+
+How it stays private:
+
+- By default EskaGate listens on `127.0.0.1` only. The home-network address is opened only when you press 📱, and it closes when EskaGate restarts.
+- The link in the QR code holds a random secret. The phone keeps it in a cookie after the first visit, so the secret leaves the address bar. Any request without it gets `401`.
+- Only devices with a private (home network) address are accepted. On the PC, `127.0.0.1` keeps working without the secret.
+- **⛔ Stop phone access** in the same window closes the network address and changes the secret, so old links and old cookies stop working.
+
+If the phone can't open the page and Ubuntu's firewall is on, allow the port for your home network (the window shows the exact command), for example:
+
+```bash
+sudo ufw allow from 192.168.0.0/16 to any port 8000 proto tcp
+```
+
+## Telegram alerts
+
+The gateway can send you a short Telegram message, wherever you are, when:
+
+- a key fails (out of credit, rejected, rate limit, provider down), and which key or provider it switched to;
+- all keys of a provider are down;
+- an agent was sending requests and then sent none for N minutes (default 10, `0` turns it off);
+- things recover ("✅ back to normal").
+
+The same cause for the same provider is sent at most once every 5 minutes. Messages contain the provider name, the agent name and a masked key such as `sk-ab…wxyz`. They never contain prompts, answers or full keys.
+
+To set it up:
+
+1. In Telegram, open **@BotFather**, send `/newbot` and copy the bot token it gives you.
+2. Open your new bot and send it `/start`.
+3. In EskaGate, open **⚙️ Settings**, paste the token under **Telegram alerts** and press **🔎 جيبو** to fill in your chat ID.
+4. Press **💾 حفظ** (save), then **📨 رسالة تجريبية** (test message).
+
+The token and chat ID are saved in `~/.api-test-console/telegram.json`, readable only by your user. The page shows them masked. Leave a field empty to keep the saved value. The toggle turns alerts off without deleting the settings.
+
 ## Update
 
 Run the one-line install command again. It updates EskaGate to the latest version and keeps your keys and settings:
@@ -176,6 +217,8 @@ EskaGate says the port is used by another program, or you see `Address already i
 | `api_web_dashboard_v2.py` | Server and the whole web page |
 | `gateway.py` | Local AI gateway (keys, failover, format translation, logs) |
 | `agents.py` | Coding-agent config switching |
+| `alerts.py` | Telegram alerts from gateway events |
+| `phone.py`, `qr.py` | Phone access over the home Wi-Fi, and the QR code generator |
 | `get.sh`, `get.ps1` | One-line installers for Ubuntu and Windows |
 | `run-api-dashboard.sh` | Linux: run in a terminal |
 | `eskali_api_launcher.sh`, `install_eskali_api.sh` | Linux: background launcher and app installer |

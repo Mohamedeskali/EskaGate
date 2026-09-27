@@ -339,6 +339,19 @@ def mark_key(provider, key, ok, kind=None, error="", retry_after=None):
         st.save()
 
 
+# Event hook for alerts (set by alerts.py): ON_EVENT(kind, **info). Never gets message content or full keys.
+ON_EVENT = lambda kind, **info: None
+
+
+def _emit(kind, **info):
+    try:
+        ON_EVENT(kind, **info)
+    except Exception:
+        pass
+
+
+ALERT_KINDS = ("invalid", "no_credit", "limited", "error")
+
 # (provider id, model) pairs that rejected the client's max_tokens: we omit it for them.
 NO_MAX_TOKENS = set()
 
@@ -467,7 +480,7 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
 
     attempts = []
     last_status, last_err = 502, "No provider answered."
-    for provider, upstream_model in targets:
+    for t_index, (provider, upstream_model) in enumerate(targets):
         up_fmt = provider.get("format", "openai")
         if client_fmt == up_fmt:
             up_body = dict(body)
@@ -486,7 +499,8 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
         effort_on = bool(level) and (provider["id"], upstream_model, level) not in NO_EFFORT
         if effort_on:
             up_body = apply_effort(json.loads(json.dumps(up_body)), up_fmt, provider, upstream_model, level)
-        for key in ordered_keys(provider):
+        keys, model_missing = ordered_keys(provider), False
+        for k_index, key in enumerate(keys):
             headers = upstream_headers(provider, key["key"], incoming_headers)
             status, resp, err = open_upstream(url, headers, up_body, timeout)
             if status == 400 and effort_on and _effort_rejected(err):
@@ -504,6 +518,8 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                 status, resp, err = open_upstream(url, headers, up_body, timeout)
             if resp is not None and 200 <= status < 300:
                 mark_key(provider, key, True)
+                _emit("key_ok", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                      key=mask_key(key["key"]))
                 return provider, key, up_fmt, upstream_model, resp, attempts
             kind, try_next = classify(status, err)
             msg = short_error(err)
@@ -511,10 +527,20 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                              "status": status, "reason": kind})
             last_status, last_err = (status or 502), msg
             if kind == "model_missing":
+                model_missing = True
                 break                              # same model on this provider's other keys: pointless
             mark_key(provider, key, False, kind, msg, (err or {}).get("_retry_after"))
+            if kind in ALERT_KINDS:
+                later = targets[t_index + 1:]
+                _emit("key_failed", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                      key=mask_key(key["key"]), reason=kind, status=status,
+                      next_key=mask_key(keys[k_index + 1]["key"]) if k_index + 1 < len(keys) else "",
+                      next_provider=later[0][0]["name"] if later else "")
             if not try_next:
                 raise GatewayError(status, msg, "invalid_request_error")
+        now = time.time()
+        if not model_missing and keys and all(k.get("cooldown_until", 0) > now for k in provider.get("keys", [])):
+            _emit("provider_down", provider_id=provider["id"], provider=provider["name"], keys=len(keys))
     raise GatewayError(last_status if last_status in (401, 402, 403, 404, 429) else 502,
                        f"All keys failed. Last error: {last_err}")
 
@@ -980,6 +1006,14 @@ def handle(handler, method):
     log = {"client": _client_name(handler), "format": client_fmt, "model": model, "stream": stream}
     incoming = {k.lower(): v for k, v in handler.headers.items()}
 
+    _emit("request", client=log["client"], phase="start")
+    try:
+        return _proxy(handler, body, client_fmt, model, stream, start, log, incoming)
+    finally:
+        _emit("request", client=log["client"], phase="end")
+
+
+def _proxy(handler, body, client_fmt, model, stream, start, log, incoming):
     try:
         provider, key, up_fmt, up_model, resp, attempts = dispatch(client_fmt, body, incoming)
     except GatewayError as e:

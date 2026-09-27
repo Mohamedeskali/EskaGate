@@ -37,6 +37,10 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gateway  # noqa: E402  (local AI gateway: providers, local key, /v1 endpoints)
 import agents   # noqa: E402  (Claude Code / opencode / pi / Hermes config switching)
+import alerts   # noqa: E402  (Telegram alerts from gateway events)
+import phone    # noqa: E402  (phone access over the home Wi-Fi, token-protected)
+import qr       # noqa: E402  (QR code for the phone link)
+from http.cookies import SimpleCookie  # noqa: E402
 
 
 class StopStreaming(Exception):
@@ -1618,6 +1622,49 @@ INDEX_HTML = r"""
   .effort-row span { white-space:nowrap; }
   .agent-card .effort-row select { font-family:inherit; }
   .effort-na { font-size:11px; color:var(--faint); }
+  /* ---------- PHONE ACCESS (QR) + TELEGRAM ---------- */
+  .qr-box { background:#fff; border-radius:var(--radius-sm); padding:10px; width:min(260px, 100%); margin:0 auto 12px; }
+  .qr-box svg { display:block; width:100%; height:auto; }
+  .phone-url { display:flex; align-items:center; gap:6px; background:var(--surface-2); border:1px solid var(--line);
+    border-radius:var(--radius-sm); padding:6px 8px; margin-bottom:12px; }
+  .phone-url code { flex:1; min-width:0; font-size:11.5px; overflow-wrap:anywhere; color:var(--text); }
+  .phone-help { font-size:12px; color:var(--muted); margin:0 0 14px; }
+  .phone-help summary { cursor:pointer; }
+  .phone-help code { font-size:11px; overflow-wrap:anywhere; }
+  .phone-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .phone-actions button { width:auto; padding:10px 16px; }
+  button.ghost.danger { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); }
+  .tg-box { border-top:1px solid var(--line-soft); margin-top:4px; }
+  .tg-box .setting-row { border-bottom:none; }
+  .tg-saved { color:var(--ok); font-weight:600; font-family:var(--font-mono); font-size:11px; }
+  .tg-inline { display:flex; gap:8px; }
+  .tg-inline input { flex:1; min-width:0; }
+  .tg-inline button { width:auto; padding:0 14px; white-space:nowrap; }
+  .tg-actions { display:flex; gap:8px; margin-bottom:12px; }
+  .tg-actions button { width:auto; padding:10px 18px; }
+  .tg-help { font-size:12px; margin:0; }
+  /* ---------- PHONE LAYOUT (≤520px): compact header, nothing wider than the screen ---------- */
+  .key-grid > *, .agent-grid > * { min-width: 0; }
+  @media (max-width: 700px) { .key-grid, .agent-grid { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 520px) {
+    header { gap: 8px; padding: 10px 12px; }
+    header .logo { width: 34px; height: 34px; border-radius: 10px; }
+    header .logo svg { width: 34px; height: 34px; }
+    header .titles { min-width: 0; }
+    header .titles h1 { font-size: 14px; }
+    header .top-actions { gap: 4px; }
+    .icon-btn { width: 32px; height: 32px; font-size: 14px; border-radius: 9px; }
+    .kcard-head { flex-wrap: wrap; padding: 12px 12px 8px; }
+    .kcard-head .pill { white-space: normal; }
+    .kcard-body { padding: 0 12px 10px; }
+    .kcard-foot { padding: 10px 12px; }
+    .modal { padding: 16px; }
+    .tg-actions { flex-wrap: wrap; }
+    .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .stat { padding: 12px 14px; }
+    .stat .num { font-size: 24px; }
+  }
+  @media (max-width: 400px) { header .titles { display: none; } }
 
   @media (max-width: 700px) { .key-row { grid-template-columns: 22px 1fr auto; } .key-row .err, .key-row .st { grid-column: 2 / 4; } }
 </style>
@@ -1635,6 +1682,7 @@ INDEX_HTML = r"""
     <button class="icon-btn" id="themeToggleBtn" title="تبديل الوضع الفاتح/الداكن" onclick="toggleTheme()">🌙</button>
     <button class="icon-btn" title="مفاتيحي والمراقبة" onclick="showTab('keys')">🔑</button>
     <button class="icon-btn" title="الإعدادات" onclick="openSettings()">⚙️</button>
+    <button class="icon-btn" id="phoneBtn" title="فتح من التيليفون (نفس الـ Wi-Fi)" onclick="openPhone()">📱</button>
   </div>
 </header>
 
@@ -2017,8 +2065,18 @@ INDEX_HTML = r"""
 </div>
 
 <!-- ============ SETTINGS MODAL ============ -->
+<div class="modal-overlay" id="phoneOverlay" onclick="if(event.target===this) closePhone()">
+  <div class="modal" style="width: min(440px, 100%);">
+    <div class="modal-header">
+      <h2>📱 فتح من التيليفون</h2>
+      <button class="modal-close" onclick="closePhone()">إغلاق ✕</button>
+    </div>
+    <div id="phoneBody"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="settingsOverlay" onclick="if(event.target===this) closeSettings()">
-  <div class="modal" style="width: min(480px, 100%);">
+  <div class="modal" style="width: min(520px, 100%);">
     <div class="modal-header">
       <h2>⚙️ الإعدادات</h2>
       <button class="modal-close" onclick="closeSettings()">إغلاق ✕</button>
@@ -2058,6 +2116,27 @@ INDEX_HTML = r"""
         <button data-min="10" onclick="setMonitorInterval(10)">10</button>
         <button data-min="30" onclick="setMonitorInterval(30)">30</button>
       </div>
+    </div>
+    <div class="tg-box">
+      <div class="setting-row">
+        <div>
+          <div class="s-label">✈️ تنبيهات Telegram</div>
+          <div class="s-sub">رسالة ملي يطيح مفتاح، ولا يطيحو جميع مفاتيح مزود، ولا يسكت وكيل، وملي يرجع كلشي عادي. كتوصلك حتى وانت برا.</div>
+        </div>
+        <div class="toggle" id="tgToggle" title="تشغيل/إيقاف التنبيهات" onclick="toggleTelegram()"></div>
+      </div>
+      <div class="field"><label>Bot token <span class="tg-saved" id="tgTokenSaved"></span></label>
+        <input id="tgToken" type="password" dir="ltr" autocomplete="off" placeholder="123456789:AA..."></div>
+      <div class="field"><label>Chat ID <span class="tg-saved" id="tgChatSaved"></span></label>
+        <div class="tg-inline"><input id="tgChat" dir="ltr" autocomplete="off" placeholder="123456789">
+          <button class="ghost" title="صيفط /start للبوت بعدا" onclick="findTelegramChat()">🔎 جيبو</button></div></div>
+      <div class="field"><label>نبهني إلا وكيل سكت كذا دقيقة (0 = لا)</label>
+        <input id="tgIdle" type="number" min="0" max="1440" dir="ltr" placeholder="10"></div>
+      <div class="tg-actions">
+        <button class="primary" onclick="saveTelegram()">💾 حفظ</button>
+        <button class="ghost" onclick="testTelegram()">📨 رسالة تجريبية</button>
+      </div>
+      <p class="modal-desc tg-help">1) فـ Telegram حل <b dir="ltr">@BotFather</b>، كتب <code>/newbot</code> ونسخ الـ token. 2) صيفط <code>/start</code> للبوت ديالك، ومن بعد ضغط "🔎 جيبو" باش نلقاو الـ Chat ID. 3) حفظ وجرب. الرسائل فيها غير اسم المزود والوكيل ومفتاح مخبي، عمرها ما فيها المحادثات ولا المفاتيح كاملين. خلي الفيلد خاوي باش تبقى القيمة المحفوظة.</p>
     </div>
   </div>
 </div>
@@ -3279,8 +3358,90 @@ function downloadReport() { downloadBlob(lastResults, 'test_report.json'); }
 /* =========================================================================
    SETTINGS MODAL
    ========================================================================= */
-function openSettings() { applyTheme(); applyToastUI(); syncMonitorUI(); document.getElementById('settingsOverlay').classList.add('open'); }
+function openSettings() { applyTheme(); applyToastUI(); syncMonitorUI(); loadTelegram(); document.getElementById('settingsOverlay').classList.add('open'); }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
+
+/* ---- phone access: LAN listener + QR, token in the link (cookie after the first visit) ---- */
+let phoneState = null;
+function setPhoneBtn() { document.getElementById('phoneBtn').classList.toggle('active', !!(phoneState && phoneState.on)); }
+async function syncPhone() {
+  try { phoneState = await api('/api/phone'); setPhoneBtn(); } catch (e) {}
+}
+async function openPhone() {
+  document.getElementById('phoneOverlay').classList.add('open');
+  const body = document.getElementById('phoneBody');
+  body.innerHTML = '<p class="modal-desc">كنحل الوصول من الشبكة...</p>';
+  try { phoneState = await api('/api/phone/start', {}); }
+  catch (e) { body.innerHTML = `<p class="modal-desc" style="color:var(--bad)">${escapeHtml(e.message)}</p>`; return; }
+  setPhoneBtn(); renderPhone();
+}
+function closePhone() { document.getElementById('phoneOverlay').classList.remove('open'); }
+function renderPhone() {
+  const st = phoneState || {}, body = document.getElementById('phoneBody');
+  if (!st.on) {
+    body.innerHTML = `<p class="modal-desc">الوصول من التيليفون مسدود، والرابط القديم ما بقاش خدام.</p>
+      <div class="phone-actions"><button class="primary" onclick="openPhone()">📱 عاود حلّو</button></div>`;
+    return;
+  }
+  body.innerHTML = `${st.here ? '<p class="modal-desc">📱 راك فاتح من التيليفون دابا.</p>' : ''}
+    <p class="modal-desc">سكاني الكود بكاميرا التيليفون. خاص التيليفون يكون فنفس الـ Wi-Fi ديال الـ PC. غادي يبان الموقع كامل.</p>
+    <div class="qr-box">${st.qr}</div>
+    <div class="phone-url"><code dir="ltr">${escapeHtml(st.url)}</code>
+      <button class="mini-copy" title="نسخ" onclick="copyRaw(phoneState && phoneState.url, this)">📋</button></div>
+    <p class="phone-help">🔒 الرابط فيه مفتاح سري: ما تعطيهش لشي حد. التيليفون كيتفكرو من بعد أول مرة، والـ PC ديما خدام بلا بيه.</p>
+    <details class="phone-help"><summary>ما بغاش يتحل فالتيليفون؟</summary>
+      <p>تأكد بلي بجوج فنفس الـ Wi-Fi (ماشي Wi-Fi ديال الضيوف). إلا كان عندك firewall فـ Ubuntu شعل:</p>
+      <code dir="ltr">sudo ufw allow from ${escapeHtml(st.ip.split('.').slice(0, 2).join('.'))}.0.0/16 to any port ${st.port} proto tcp</code></details>
+    <div class="phone-actions"><button class="ghost danger" onclick="stopPhone()">⛔ وقف الوصول من التيليفون</button></div>`;
+}
+async function stopPhone() {
+  try { phoneState = await api('/api/phone/stop', {}); }
+  catch (e) { toast('ما توقفش', 'bad', e.message); return; }
+  setPhoneBtn(); renderPhone();
+  toast('تسد الوصول من التيليفون', 'ok', 'المفتاح السري تبدل، الرابط والكود القدام ما بقاوش خدامين.');
+}
+
+/* ---- Telegram alerts (settings saved on the server, token/chat shown masked) ---- */
+let tgState = null;
+async function loadTelegram() {
+  try { tgState = await api('/api/telegram'); } catch (e) { return; }
+  renderTelegram();
+}
+function renderTelegram() {
+  const t = tgState || {};
+  document.getElementById('tgToggle').classList.toggle('on', !!(t.enabled && t.configured));
+  document.getElementById('tgTokenSaved').innerHTML = t.bot_token ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.bot_token)}</bdi>` : '';
+  document.getElementById('tgChatSaved').innerHTML = t.chat_id ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.chat_id)}</bdi>` : '';
+  document.getElementById('tgIdle').value = t.idle_minutes ?? 10;
+}
+function tgForm() {
+  return { bot_token: document.getElementById('tgToken').value.trim(), chat_id: document.getElementById('tgChat').value.trim(),
+    idle_minutes: Number(document.getElementById('tgIdle').value || 0) };
+}
+async function saveTelegram(extra) {
+  try { tgState = await api('/api/telegram/save', { ...tgForm(), ...(extra || {}) }); }
+  catch (e) { toast('ما تحفظش', 'bad', e.message); return false; }
+  document.getElementById('tgToken').value = ''; document.getElementById('tgChat').value = '';
+  renderTelegram();
+  toast(tgState.configured ? 'تحفظو إعدادات Telegram' : 'تحفظ، ولكن باقي خاص الـ token والـ Chat ID', tgState.configured ? 'ok' : 'warn');
+  return true;
+}
+function toggleTelegram() {
+  const t = tgState || {};
+  if (!t.configured) return toast('عمّر الـ Bot token والـ Chat ID وضغط حفظ بعدا', 'warn');
+  saveTelegram({ enabled: !t.enabled });
+}
+async function testTelegram() {
+  try { await api('/api/telegram/test', tgForm()); toast('تصيفطات. شوف Telegram 📨', 'ok'); }
+  catch (e) { toast('ما تصيفطاتش', 'bad', e.message); }
+}
+async function findTelegramChat() {
+  try {
+    const r = await api('/api/telegram/chat-id', { bot_token: document.getElementById('tgToken').value.trim() });
+    document.getElementById('tgChat').value = r.chat_id;
+    toast('لقيت الـ Chat ID' + (r.name ? ` (${r.name})` : ''), 'ok', 'ضغط حفظ باش يتسجل.');
+  } catch (e) { toast('ما لقيتش', 'bad', e.message); }
+}
 
 
 /* =========================================================================
@@ -3925,7 +4086,7 @@ function onTabShown(name) {
    INIT
    ========================================================================= */
 document.addEventListener('DOMContentLoaded', async () => {
-  applyTheme(); applyToastUI(); initNav();
+  applyTheme(); applyToastUI(); initNav(); syncPhone();
   await initServerStore();
   refreshProfileSelect();
   updateKeyStats();
@@ -3990,13 +4151,64 @@ class Handler(BaseHTTPRequestHandler):
         and a custom header, which other websites can't send without a CORS
         preflight this server never approves.
         """
+        allowed = ((self.server.server_address[0],) if getattr(self.server, "lan", False)
+                   else ("127.0.0.1", "localhost", "::1"))   # phone access: only the LAN address itself
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        if host not in allowed:
             return False
         origin = self.headers.get("Origin")
-        if origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost", "::1"):
+        if origin and urlparse(origin).hostname not in allowed:
             return False
         return self.headers.get("X-Console") == "1"
+
+    def _lan_gate(self):
+        """Requests on the phone (LAN) listener need the token: ?token= once (saved as a cookie), then the cookie.
+        Returns True when the request may continue; otherwise the answer was already sent."""
+        if not getattr(self.server, "lan", False):
+            return True
+        if not phone.is_private(self.client_address[0]):
+            self._deny(403, "هاد الوصول غير من الشبكة ديال الدار.")
+            return False
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+        if self.command == "GET" and phone.token_ok((query.get("token") or [""])[0]):
+            rest = "&".join(f"{k}={v}" for k, vals in query.items() if k != "token" for v in vals)
+            self.send_response(303)
+            self.send_header("Set-Cookie", f"{phone.COOKIE}={phone.token()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+            self.send_header("Location", url.path + ("?" + rest if rest else ""))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        try:
+            jar = SimpleCookie(self.headers.get("Cookie") or "")
+        except Exception:
+            jar = {}
+        if phone.token_ok(jar[phone.COOKIE].value if phone.COOKIE in jar else ""):
+            return True
+        self._deny(401, "🔒 الرابط تبدل ولا ما صالحش. فالـ PC ضغط على 📱 وسكاني QR من جديد.")
+        return False
+
+    def _deny(self, status, message):
+        if self.path.startswith(("/api/", "/v1/")):
+            return self._json(status, {"error": message})
+        body = (f'<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">'
+                f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>EskaGate</title>'
+                f'<body style="font-family:system-ui,sans-serif;background:#0f1220;color:#e8eaf6;display:grid;'
+                f'place-items:center;min-height:90vh;margin:0;padding:16px;text-align:center">'
+                f'<p style="font-size:18px;line-height:1.7">{message}</p></body></html>').encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _phone_state(self):
+        st = phone.status()
+        if st.get("on"):
+            st["qr"] = qr.svg(st["url"])
+        st["here"] = bool(getattr(self.server, "lan", False))   # page opened from the phone itself
+        return st
 
     def _gateway_root(self):
         return f"http://127.0.0.1:{self.server.server_port}"
@@ -4012,6 +4224,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- routes ------------------------------------------------------------
     def do_GET(self):
+        if not self._lan_gate():
+            return
         path = urlparse(self.path).path
         if gateway.is_gateway_path(path):
             return gateway.handle(self, "GET")
@@ -4028,6 +4242,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "Forbidden"})
             if path == "/api/gateway/state":
                 return self._json(200, self._state())
+            if path == "/api/phone":
+                return self._json(200, self._phone_state())
+            if path == "/api/telegram":
+                return self._json(200, alerts.public())
             if path == "/api/logs":
                 limit = int((parse_qs(urlparse(self.path).query).get("limit") or ["200"])[0])
                 return self._json(200, {"logs": gateway.get_logs(min(limit, gateway.MAX_LOGS))})
@@ -4040,6 +4258,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404, "Not found")
 
     def do_POST(self):
+        if not self._lan_gate():
+            return
         path = urlparse(self.path).path
         if gateway.is_gateway_path(path):
             return gateway.handle(self, "POST")
@@ -4090,6 +4310,19 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/gateway/regenerate":
             gateway.regenerate_local_key()
             return {**self._state(), "agents_updated": agents.refresh_enabled(root)}
+        elif path == "/api/phone/start":
+            phone.start(Handler, self.server.server_address[1])
+            return self._phone_state()
+        elif path == "/api/phone/stop":
+            phone.stop()
+            return self._phone_state()
+        elif path == "/api/telegram/save":
+            return alerts.save(p)
+        elif path == "/api/telegram/test":
+            alerts.test(p)
+            return {"ok": True}
+        elif path == "/api/telegram/chat-id":
+            return alerts.find_chat_id(p)
         elif path == "/api/logs/clear":
             gateway.clear_logs()
             return {"ok": True}
@@ -4249,6 +4482,7 @@ def main():
         pass
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    alerts.start()
     url = f"http://{args.host}:{args.port}"
     print(f"EskaGate شغال على: {url}")
     print("Ctrl+C باش توقفو.")
