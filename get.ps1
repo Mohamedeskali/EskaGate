@@ -2,10 +2,13 @@
 #   irm https://raw.githubusercontent.com/Mohamedeskali/EskaGate/main/get.ps1 | iex
 # Downloads the project ZIP (no git needed) to %LOCALAPPDATA%\EskaGate, adds Start Menu and
 # Desktop shortcuts, then starts the app. Your keys and settings live in
-# %USERPROFILE%\.api-test-console and are never touched.
+# %USERPROFILE%\.api-test-console and are never touched. Run it again to update. To uninstall:
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Mohamedeskali/EskaGate/main/get.ps1))) -Uninstall
 # Runs inside "& { }" and never calls exit, so it cannot close the PowerShell window it runs in.
+# The parameter lives on that inner block (fed by @args), so "irm | iex" defines nothing in your session.
 
 & {
+    param([switch]$Uninstall)
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'   # the progress bar makes downloads very slow on PowerShell 5.1
 
@@ -52,6 +55,21 @@
         } catch { return $false }
     }
 
+    # Stops a copy started from the install folder, and its EskaGate.cmd window (never another terminal).
+    function Stop-EskaGate {
+        $found = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($Script, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        foreach ($p in $found) {
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.ParentProcessId)" -ErrorAction SilentlyContinue
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            if ($parent -and $parent.Name -eq 'cmd.exe' -and $parent.CommandLine -like '*EskaGate.cmd*') {
+                Stop-Process -Id $parent.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($found.Count) { Start-Sleep -Milliseconds 500 }
+        return $found.Count
+    }
+
     function New-Shortcut($path, $target) {
         $shell = New-Object -ComObject WScript.Shell
         $lnk = $shell.CreateShortcut($path)
@@ -65,6 +83,38 @@
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('eskagate-' + [Guid]::NewGuid().ToString('N'))
     try {
         if ($env:OS -ne 'Windows_NT') { throw 'This installer is for Windows. On Linux use get.sh.' }
+        $startMenu = [Environment]::GetFolderPath('Programs')
+        $desktop = [Environment]::GetFolderPath('Desktop')
+
+        # --- Uninstall --------------------------------------------------------
+        if ($Uninstall) {
+            if ((Test-Path -LiteralPath $InstallDir) -and -not (Test-Path -LiteralPath $Script)) {
+                throw "$InstallDir does not look like EskaGate; not removing it."
+            }
+            if (Stop-EskaGate) { Say 'Stopped EskaGate' }
+            $shell = New-Object -ComObject WScript.Shell
+            foreach ($folder in @($startMenu, $desktop) | Where-Object { $_ }) {
+                # Only shortcuts that point into this install.
+                $lnk = Join-Path $folder 'EskaGate.lnk'
+                if ((Test-Path -LiteralPath $lnk) -and
+                    $shell.CreateShortcut($lnk).TargetPath.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase)) {
+                    Remove-Item -LiteralPath $lnk -Force
+                    Say "Removed $lnk"
+                }
+            }
+            if (Test-Path -LiteralPath $InstallDir) {
+                try { Remove-Item -LiteralPath $InstallDir -Recurse -Force }
+                catch { throw "Could not remove $InstallDir. Close any EskaGate window and run this again. ($($_.Exception.Message))" }
+                Say "Removed $InstallDir"
+            } else {
+                Say "$InstallDir is not there; nothing else to remove."
+            }
+            Write-Host ''
+            Write-Host 'EskaGate is uninstalled.' -ForegroundColor Green
+            Write-Host "    Your keys and settings are still in $env:USERPROFILE\.api-test-console"
+            Write-Host '    To delete them too, delete that folder.'
+            return
+        }
 
         # --- Python -----------------------------------------------------------
         $python = Find-Python
@@ -106,18 +156,7 @@
         $updating = Test-Path -LiteralPath $Script
         if ($updating) {
             Say "Updating $InstallDir"
-            Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
-                Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($Script, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
-                ForEach-Object {
-                    Say 'Stopping the running copy to load the update'
-                    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ParentProcessId)" -ErrorAction SilentlyContinue
-                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-                    # Also close its EskaGate.cmd window (never some other terminal).
-                    if ($parent -and $parent.Name -eq 'cmd.exe' -and $parent.CommandLine -like '*EskaGate.cmd*') {
-                        Stop-Process -Id $parent.ProcessId -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            Start-Sleep -Milliseconds 500
+            if (Stop-EskaGate) { Say 'Stopped the running copy to load the update' }
         } else {
             Say "Installing to $InstallDir"
         }
@@ -134,8 +173,6 @@
                "`"$python`" `"%~dp0api_web_dashboard_v2.py`" --port $Port --open`r`npause`r`n"
         [IO.File]::WriteAllText($launcher, $cmd, (New-Object Text.UTF8Encoding $false))
 
-        $startMenu = [Environment]::GetFolderPath('Programs')
-        $desktop = [Environment]::GetFolderPath('Desktop')
         New-Shortcut (Join-Path $startMenu 'EskaGate.lnk') $launcher
         if ($desktop) { New-Shortcut (Join-Path $desktop 'EskaGate.lnk') $launcher }
         Say 'Added EskaGate to the Start Menu and the Desktop'
@@ -157,4 +194,4 @@
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
-}
+} @args
