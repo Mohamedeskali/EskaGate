@@ -134,6 +134,9 @@ The gateway can send you a short Telegram message, wherever you are, when:
 - an agent was sending requests and then sent none for N minutes (default 10, `0` turns it off);
 - things recover ("✅ back to normal").
 
+- **Daily summary:** once a day (default 09:00, PC time), one message per agent that had traffic: requests, tokens, and how many times its key was switched since the last summary. If the PC was off at that time, it is sent when EskaGate starts later that day.
+- **Early warning:** when a key's remaining requests or tokens drop under 10% of its limit, one warning per key per day, before it actually fails.
+
 The same cause for the same provider is sent at most once every 5 minutes. Messages contain the provider name, the agent name and a masked key such as `sk-ab…wxyz`. They never contain prompts, answers or full keys.
 
 To set it up:
@@ -142,6 +145,15 @@ To set it up:
 2. Open your new bot and send it `/start`.
 3. In EskaGate, open **⚙️ Settings**, paste the token under **Telegram alerts** and press **🔎 جيبو** to fill in your chat ID.
 4. Press **💾 حفظ** (save), then **📨 رسالة تجريبية** (test message).
+
+**Control from Telegram.** Send these to your bot. Only the saved chat ID is answered; other chats are ignored.
+
+- `/status`: one line per provider with the active key (★), how many keys work or are cooling down, and the reported quota.
+- `/switch <provider>`: makes the next available key (not cooling down, not rejected) the active ★ key of that provider, and replies with the result.
+
+**Remaining quota.** After each request the gateway reads the provider's rate-limit headers (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`, `anthropic-ratelimit-*`, `ratelimit-*` and similar). The numbers show on each key in the Providers tab and in the alerts. A provider that never sends them shows "ما مصرحش" (not reported). Nothing is guessed and no extra endpoint is called.
+
+**Alert history.** Every alert sent is logged in `~/.api-test-console/alert-history.jsonl` (time, provider, type, message). The Gateway tab shows it under **🔔 سجل التنبيهات**, filterable by provider or agent, type and period, with counts per provider and type (for example how many times a provider ran out of credit this month).
 
 The token and chat ID are saved in `~/.api-test-console/telegram.json`, readable only by your user. The page shows them masked. Leave a field empty to keep the saved value. The toggle turns alerts off without deleting the settings.
 

@@ -134,6 +134,7 @@ class Store:
                         "last_checked": k.get("last_checked"), "last_used": k.get("last_used"),
                         "cooldown_left": int(k["cooldown_until"] - now) if cooling else 0,
                         "active": k["id"] == p.get("active_key_id"),
+                        "quota": k.get("quota"),
                     })
                 out.append({
                     "id": p["id"], "name": p["name"], "base_url": p["base_url"],
@@ -188,6 +189,7 @@ def _load_logs():
 def add_log(entry):
     entry = dict(entry)
     entry["time"] = time.time()
+    _emit("request_logged", **{k: entry.get(k) for k in ("client", "status", "tokens_in", "tokens_out", "failovers")})
     with _log_lock:
         _load_logs()
         _logs.append(entry)
@@ -257,12 +259,123 @@ def open_upstream(url, headers, body, timeout):
             err = json.loads(raw)
         except Exception:
             err = {"error": {"message": raw[:300]}}
+        if not isinstance(err, dict):
+            err = {"error": {"message": raw[:300]}}
         retry_after = e.headers.get("Retry-After") if e.headers else None
         if retry_after:
             err["_retry_after"] = retry_after
+        quota = parse_quota(e.headers)
+        if quota:
+            err["_quota"] = quota
         return e.code, None, err
     except Exception as e:
         return 0, None, {"error": {"message": f"Connection error: {getattr(e, 'reason', e)}"}}
+
+
+# ---------------------------------------------------------------------------
+# Remaining quota, only as reported by the provider's rate-limit headers
+# (never guessed, never fetched from another endpoint).
+# ---------------------------------------------------------------------------
+_QUOTA_HEADERS = {   # bucket: [(limit, remaining, reset), ...] header families seen in the wild
+    "requests": [("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests"),
+                 ("anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+                  "anthropic-ratelimit-requests-reset"),
+                 ("x-ratelimit-requests-limit", "x-ratelimit-requests-remaining", "x-ratelimit-requests-reset"),
+                 ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"),
+                 ("ratelimit-limit", "ratelimit-remaining", "ratelimit-reset")],
+    "tokens": [("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"),
+               ("anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
+                "anthropic-ratelimit-tokens-reset"),
+               ("x-ratelimit-tokens-limit", "x-ratelimit-tokens-remaining", "x-ratelimit-tokens-reset"),
+               ("x-ratelimit-limit-tokens-minute", "x-ratelimit-remaining-tokens-minute",
+                "x-ratelimit-reset-tokens-minute")],
+    "requests_day": [("x-ratelimit-limit-requests-day", "x-ratelimit-remaining-requests-day",
+                      "x-ratelimit-reset-requests-day")],
+    "tokens_day": [("x-ratelimit-limit-tokens-day", "x-ratelimit-remaining-tokens-day",
+                    "x-ratelimit-reset-tokens-day")],
+}
+QUOTA_LABEL = {"requests": "طلبات", "tokens": "tokens", "requests_day": "طلبات/نهار", "tokens_day": "tokens/نهار"}
+LOW_QUOTA = 0.10
+
+
+def _num(v):
+    m = re.match(r"\s*(\d+(?:\.\d+)?)", str(v or ""))      # "100", "100, 100;w=60" -> 100
+    return int(float(m.group(1))) if m else None
+
+
+def parse_quota(headers):
+    """{bucket: {"limit", "remaining", "reset"}} from rate-limit headers; {} when there are none."""
+    if not headers:
+        return {}
+    h = {k.lower(): v for k, v in headers.items()}
+    out = {}
+    for bucket, families in _QUOTA_HEADERS.items():
+        for lim, rem, reset in families:
+            remaining = _num(h.get(rem))
+            if remaining is None:
+                continue
+            out[bucket] = {"limit": _num(h.get(lim)), "remaining": remaining, "reset": str(h.get(reset) or "")[:40]}
+            break
+    return out
+
+
+def quota_text(quota):
+    """'طلبات 3/500 · tokens 1.2k/10k' for messages; '' when nothing was reported."""
+    def n(v):
+        return "?" if v is None else f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.1f}k" if v >= 1e4 else str(v)
+    buckets = (quota or {}).get("buckets") or {}
+    return " · ".join(f"{QUOTA_LABEL.get(b, b)} {n(q['remaining'])}/{n(q.get('limit'))}" for b, q in buckets.items())
+
+
+def record_quota(provider, key, quota):
+    """Keep the latest reported numbers on the key; warn (event) when a bucket is under LOW_QUOTA."""
+    if not quota:
+        return
+    with store().lock:
+        key["quota"] = {"at": time.time(), "buckets": quota}
+    for bucket, q in quota.items():
+        if q.get("limit") and q["remaining"] < q["limit"] * LOW_QUOTA:
+            _emit("quota_low", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                  key=mask_key(key["key"]), bucket=QUOTA_LABEL.get(bucket, bucket), remaining=q["remaining"],
+                  limit=q["limit"], reset=q.get("reset", ""))
+
+
+def switch_active_key(ref):
+    """Make the next available key (not cooling down, not rejected) the active ★ one.
+    `ref` is a provider name or id. Returns (provider, old_key_or_None, new_key)."""
+    st = store()
+    ref = str(ref or "").strip().lower()
+    with st.lock:
+        p = next((p for p in st.providers() if p["id"].lower() == ref or p["name"].lower() == ref), None)
+        if not p:
+            raise ValueError("Unknown provider.")
+        keys, now = p.get("keys", []), time.time()
+        cur = p.get("active_key_id")
+        idx = next((i for i, k in enumerate(keys) if k["id"] == cur), -1)
+        order = keys[idx + 1:] + keys[:idx + 1]
+        new = next((k for k in order if k["id"] != cur and k.get("cooldown_until", 0) <= now
+                    and k.get("status") != "invalid"), None)
+        if not new:
+            raise ValueError("No other available key.")
+        old = next((k for k in keys if k["id"] == cur), None)
+        p["active_key_id"] = new["id"]
+        st.save()
+        return p, old, new
+
+
+def provider_status_lines():
+    """One line per provider: active key, working / cooling counts, reported quota."""
+    now, lines = time.time(), []
+    for p in store().providers():
+        keys = p.get("keys", [])
+        cooling = sum(1 for k in keys if k.get("cooldown_until", 0) > now)
+        working = sum(1 for k in keys if k.get("status") == "ok" and k.get("cooldown_until", 0) <= now)
+        active = next((k for k in keys if k["id"] == p.get("active_key_id")), None)
+        q = quota_text(active.get("quota")) if active else ""
+        lines.append(f"{'⏸ ' if not p.get('enabled', True) else ''}{p['name']}: "
+                     f"{'★ ' + mask_key(active['key']) if active else '★ —'} · {working} خدام · {cooling} كيرتاح"
+                     f" / {len(keys)}" + (f" · 📊 {q}" if q else ""))
+    return lines
 
 
 def short_error(err):
@@ -517,6 +630,7 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                 NO_MAX_TOKENS.add((provider["id"], upstream_model))
                 status, resp, err = open_upstream(url, headers, up_body, timeout)
             if resp is not None and 200 <= status < 300:
+                record_quota(provider, key, parse_quota(resp.headers))
                 mark_key(provider, key, True)
                 _emit("key_ok", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
                       key=mask_key(key["key"]))
@@ -529,11 +643,12 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
             if kind == "model_missing":
                 model_missing = True
                 break                              # same model on this provider's other keys: pointless
+            record_quota(provider, key, (err or {}).get("_quota"))
             mark_key(provider, key, False, kind, msg, (err or {}).get("_retry_after"))
             if kind in ALERT_KINDS:
                 later = targets[t_index + 1:]
                 _emit("key_failed", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
-                      key=mask_key(key["key"]), reason=kind, status=status,
+                      key=mask_key(key["key"]), reason=kind, status=status, quota=quota_text(key.get("quota")),
                       next_key=mask_key(keys[k_index + 1]["key"]) if k_index + 1 < len(keys) else "",
                       next_provider=later[0][0]["name"] if later else "")
             if not try_next:

@@ -1643,6 +1643,29 @@ INDEX_HTML = r"""
   .tg-actions { display:flex; gap:8px; margin-bottom:12px; }
   .tg-actions button { width:auto; padding:10px 18px; }
   .tg-help { font-size:12px; margin:0; }
+  .tg-sub { border-bottom:none; padding-top:0; }
+  .tg-sub input[type=time] { background:var(--surface-2); border:1px solid var(--line); color:var(--text);
+    border-radius:var(--radius-sm); padding:6px 8px; font-family:var(--font-mono); font-size:12px; }
+  .key-row .quota { grid-column: 2 / -1; font-size:11px; color:var(--muted); margin-top:-4px; }
+  .key-row .quota b { font-family:var(--font-mono); font-weight:600; color:var(--text); }
+  .key-row .quota .low, .key-row .quota .low b { color:var(--warn); font-weight:700; }
+  .key-row .quota .q-at { color:var(--faint); }
+  /* ---------- ALERT HISTORY ---------- */
+  .ah-card { margin-top:16px; }
+  .ah-filters { display:flex; gap:6px; flex-wrap:wrap; }
+  .ah-filters select { background:var(--surface-2); border:1px solid var(--line); color:var(--text);
+    border-radius:var(--radius-sm); padding:6px 8px; font:inherit; font-size:12px; }
+  .ah-counts { margin-bottom:10px; }
+  .ah-counts td, .ah-counts th { text-align:center; white-space:nowrap; }
+  .ah-counts td:first-child { text-align:start; font-weight:700; }
+  .ah-row { display:grid; grid-template-columns: 150px auto 120px minmax(0, 1fr); gap:10px; align-items:center;
+    padding:8px 16px; border-top:1px solid var(--line-soft); font-size:12px; }
+  .ah-time { font-size:11px; color:var(--muted); }
+  .ah-src { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ah-msg { color:var(--muted); overflow-wrap:anywhere; }
+  .ah-more { padding:8px 16px; color:var(--faint); font-size:12px; }
+  @media (max-width: 700px) { .key-row .acts { grid-column: 3; grid-row: 1; } .key-row .quota { grid-column: 2 / 4; margin-top: 0; } }
+  @media (max-width: 700px) { .ah-row { grid-template-columns: auto minmax(0, 1fr); } .ah-row .ah-msg { grid-column: 1 / -1; } }
   /* ---------- PHONE LAYOUT (≤520px): compact header, nothing wider than the screen ---------- */
   .key-grid > *, .agent-grid > * { min-width: 0; }
   @media (max-width: 700px) { .key-grid, .agent-grid { grid-template-columns: minmax(0, 1fr); } }
@@ -1968,6 +1991,21 @@ INDEX_HTML = r"""
         </table>
       </div>
     </div>
+    <div class="card ah-card">
+      <div class="card-head">
+        <h3>🔔 سجل التنبيهات</h3>
+        <div class="spacer"></div>
+        <div class="ah-filters">
+          <select id="ahSource" onchange="renderAlertHistory()"><option value="">كل المزودين والوكلاء</option></select>
+          <select id="ahType" onchange="renderAlertHistory()"><option value="">كل الأنواع</option></select>
+          <select id="ahPeriod" onchange="renderAlertHistory()">
+            <option value="month">هاد الشهر</option><option value="7">آخر 7 أيام</option>
+            <option value="30">آخر 30 يوم</option><option value="all">كلشي</option></select>
+        </div>
+      </div>
+      <div id="ahCounts"></div>
+      <div id="ahList"></div>
+    </div>
   </div>
 
   <!-- ================================================================
@@ -2132,11 +2170,19 @@ INDEX_HTML = r"""
           <button class="ghost" title="صيفط /start للبوت بعدا" onclick="findTelegramChat()">🔎 جيبو</button></div></div>
       <div class="field"><label>نبهني إلا وكيل سكت كذا دقيقة (0 = لا)</label>
         <input id="tgIdle" type="number" min="0" max="1440" dir="ltr" placeholder="10"></div>
+      <div class="setting-row tg-sub">
+        <div>
+          <div class="s-label">📊 ملخص يومي</div>
+          <div class="s-sub">رسالة لكل وكيل خدم: شحال من طلب، شحال من token، وشحال من مرة تبدل المفتاح.</div>
+        </div>
+        <input id="tgSummaryTime" type="time" dir="ltr" value="09:00" title="وقت الملخص (ساعة الـ PC)">
+        <div class="toggle" id="tgSummaryToggle" title="تشغيل/إيقاف الملخص" onclick="toggleSummary()"></div>
+      </div>
       <div class="tg-actions">
         <button class="primary" onclick="saveTelegram()">💾 حفظ</button>
         <button class="ghost" onclick="testTelegram()">📨 رسالة تجريبية</button>
       </div>
-      <p class="modal-desc tg-help">1) فـ Telegram حل <b dir="ltr">@BotFather</b>، كتب <code>/newbot</code> ونسخ الـ token. 2) صيفط <code>/start</code> للبوت ديالك، ومن بعد ضغط "🔎 جيبو" باش نلقاو الـ Chat ID. 3) حفظ وجرب. الرسائل فيها غير اسم المزود والوكيل ومفتاح مخبي، عمرها ما فيها المحادثات ولا المفاتيح كاملين. خلي الفيلد خاوي باش تبقى القيمة المحفوظة.</p>
+      <p class="modal-desc tg-help">1) فـ Telegram حل <b dir="ltr">@BotFather</b>، كتب <code>/newbot</code> ونسخ الـ token. 2) صيفط <code>/start</code> للبوت ديالك، ومن بعد ضغط "🔎 جيبو" باش نلقاو الـ Chat ID. 3) حفظ وجرب. 4) من Telegram: <code dir="ltr">/status</code> كيعطيك الحالة، و<code dir="ltr">/switch provider</code> كيدير المفتاح الجاي هو ★. غير الـ Chat ID المحفوظ لي كيتسمع ليه. الرسائل فيها غير اسم المزود والوكيل ومفتاح مخبي، عمرها ما فيها المحادثات ولا المفاتيح كاملين. خلي الفيلد خاوي باش تبقى القيمة المحفوظة.</p>
     </div>
   </div>
 </div>
@@ -3413,10 +3459,17 @@ function renderTelegram() {
   document.getElementById('tgTokenSaved').innerHTML = t.bot_token ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.bot_token)}</bdi>` : '';
   document.getElementById('tgChatSaved').innerHTML = t.chat_id ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.chat_id)}</bdi>` : '';
   document.getElementById('tgIdle').value = t.idle_minutes ?? 10;
+  document.getElementById('tgSummaryToggle').classList.toggle('on', !!t.summary);
+  document.getElementById('tgSummaryTime').value = t.summary_time || '09:00';
+}
+function toggleSummary() {
+  if (!(tgState || {}).configured) return toast('عمّر الـ Bot token والـ Chat ID وضغط حفظ بعدا', 'warn');
+  saveTelegram({ summary: !tgState.summary });
 }
 function tgForm() {
   return { bot_token: document.getElementById('tgToken').value.trim(), chat_id: document.getElementById('tgChat').value.trim(),
-    idle_minutes: Number(document.getElementById('tgIdle').value || 0) };
+    idle_minutes: Number(document.getElementById('tgIdle').value || 0),
+    summary_time: document.getElementById('tgSummaryTime').value || '09:00' };
 }
 async function saveTelegram(extra) {
   try { tgState = await api('/api/telegram/save', { ...tgForm(), ...(extra || {}) }); }
@@ -3474,6 +3527,18 @@ async function loadGateway() {
 }
 
 /* ---------------- providers ---------------- */
+// Remaining quota, only as the provider reported it in its rate-limit headers (never guessed).
+const QUOTA_LABEL = { requests: 'طلبات', tokens: 'tokens', requests_day: 'طلبات/نهار', tokens_day: 'tokens/نهار' };
+function fmtCount(n) { return n == null ? '?' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n); }
+function quotaHtml(q) {
+  const b = q && q.buckets ? Object.entries(q.buckets) : [];
+  if (!b.length) return '<span class="quota" title="المزود ما كيصرحش بالباقي فالـ headers ديالو">📊 الباقي: ما مصرحش</span>';
+  const parts = b.map(([name, v]) => {
+    const low = v.limit && v.remaining < v.limit * 0.1;
+    return `<span class="${low ? 'low' : ''}" title="${v.reset ? 'كيرجع: ' + escapeHtml(v.reset) : ''}">${QUOTA_LABEL[name] || escapeHtml(name)} <b dir="ltr">${fmtCount(v.remaining)}/${fmtCount(v.limit)}</b>${low ? ' ⚠️' : ''}</span>`;
+  });
+  return `<span class="quota">📊 ${parts.join(' · ')} <span class="q-at">${timeAgo(q.at * 1000)}</span></span>`;
+}
 function renderProviders() {
   const wrap = document.getElementById('providersList');
   if (!wrap || !gwState) return;
@@ -3496,6 +3561,7 @@ function renderProviders() {
           <button class="ghost" title="اختبار كامل فتبويب الاختبار" onclick="openKeyInTester('${esc(p.id)}', '${esc(k.id)}')">🔬</button>
           <button class="ghost" title="حذف المفتاح" onclick="deleteProviderKey('${esc(p.id)}', '${esc(k.id)}')">🗑</button>
         </span>
+        ${quotaHtml(k.quota)}
       </div>`;
     }).join('') || '<div class="empty-state" style="padding:14px;">ما كاين حتى مفتاح.</div>';
     const models = p.models.length
@@ -3729,6 +3795,45 @@ async function loadLogs() {
       <td class="mono">${l.ms != null ? (l.ms / 1000).toFixed(2) + 's' : '—'}</td>
     </tr>`;
   }).join('');
+}
+/* ---- alert history (every Telegram alert sent, from alert-history.jsonl) ---- */
+const AH_TYPES = { no_credit: '💳 سالا الرصيد', invalid: '🚫 مفتاح مرفوض', limited: '⏱ rate limit', error: '🔥 المزود ما جاوبش',
+  provider_down: '🔴 المزود طايح كامل', recovered: '✅ رجع عادي', quota_low: '🟠 قرب يسالي', idle: '💤 وكيل سكت',
+  active: '▶️ وكيل رجع', summary: '📊 ملخص يومي' };
+let ahEntries = [];
+async function loadAlertHistory() {
+  try { ahEntries = (await api('/api/alerts/history')).entries || []; } catch (e) { return; }
+  const fill = (id, values, label) => {
+    const el = document.getElementById(id), cur = el.value;
+    el.innerHTML = el.options[0].outerHTML + values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(label(v))}</option>`).join('');
+    el.value = values.includes(cur) ? cur : '';
+  };
+  fill('ahSource', [...new Set(ahEntries.map(ahSource))].sort(), v => v);
+  fill('ahType', [...new Set(ahEntries.map(e => e.type))], v => AH_TYPES[v] || v);
+  renderAlertHistory();
+}
+function ahSource(e) { return e.provider || (e.agent ? '🤖 ' + e.agent : '—'); }
+function renderAlertHistory() {
+  const src = document.getElementById('ahSource').value, type = document.getElementById('ahType').value;
+  const period = document.getElementById('ahPeriod').value, now = new Date();
+  const from = period === 'month' ? new Date(now.getFullYear(), now.getMonth(), 1).getTime() / 1000
+    : period === 'all' ? 0 : now.getTime() / 1000 - Number(period) * 86400;
+  const list = ahEntries.filter(e => e.time >= from && (!src || ahSource(e) === src) && (!type || e.type === type));
+  // Counts: one row per provider/agent, one column per alert type (e.g. how often a provider ran out of credit).
+  const types = Object.keys(AH_TYPES).filter(t => list.some(e => e.type === t));
+  const rows = {};
+  list.forEach(e => { const r = rows[ahSource(e)] = rows[ahSource(e)] || {}; r[e.type] = (r[e.type] || 0) + 1; });
+  document.getElementById('ahCounts').innerHTML = list.length ? `<div style="overflow-x:auto;"><table class="ah-counts">
+    <thead><tr><th></th>${types.map(t => `<th>${AH_TYPES[t]}</th>`).join('')}<th>المجموع</th></tr></thead>
+    <tbody>${Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])).map(([name, r]) => `<tr><td>${escapeHtml(name)}</td>
+      ${types.map(t => `<td class="mono">${r[t] || '·'}</td>`).join('')}<td class="mono"><b>${Object.values(r).reduce((a, b) => a + b, 0)}</b></td></tr>`).join('')}</tbody>
+    </table></div>` : '<div class="empty-state" style="padding:14px;">ما كاين حتى تنبيه فهاد الفترة.</div>';
+  document.getElementById('ahList').innerHTML = list.slice(0, 100).map(e => `<div class="ah-row">
+      <span class="mono ah-time">${new Date(e.time * 1000).toLocaleString()}</span>
+      <span class="pill ${e.sent === false ? 'bad' : 'pending'}">${AH_TYPES[e.type] || escapeHtml(e.type)}${e.sent === false ? ' · ما تصيفطش' : ''}</span>
+      <span class="ah-src">${escapeHtml(ahSource(e))}</span>
+      <span class="ah-msg" title="${escapeHtml(e.error || '')}">${escapeHtml(String(e.message || '').split('\n').slice(1).join(' · '))}</span>
+    </div>`).join('') + (list.length > 100 ? `<div class="ah-more">+${list.length - 100} قدام</div>` : '');
 }
 async function clearGatewayLogs() {
   if (!confirm('تمسح السجل كامل؟')) return;
@@ -4078,7 +4183,7 @@ async function saveIcon(id, image) {
 function onTabShown(name) {
   if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
   if (name === 'providers') loadGateway();
-  if (name === 'gateway') { loadGateway(); loadLogs(); logsTimer = setInterval(loadLogs, 4000); }
+  if (name === 'gateway') { loadGateway(); loadLogs(); loadAlertHistory(); logsTimer = setInterval(loadLogs, 4000); }
   if (name === 'agents') { loadGateway(); loadAgents(); }
 }
 
@@ -4246,6 +4351,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._phone_state())
             if path == "/api/telegram":
                 return self._json(200, alerts.public())
+            if path == "/api/alerts/history":
+                return self._json(200, {"entries": alerts.history()})
             if path == "/api/logs":
                 limit = int((parse_qs(urlparse(self.path).query).get("limit") or ["200"])[0])
                 return self._json(200, {"logs": gateway.get_logs(min(limit, gateway.MAX_LOGS))})

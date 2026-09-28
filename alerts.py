@@ -1,12 +1,17 @@
 """
-Telegram alerts from the gateway.
+Telegram alerts, daily summary and bot commands for the gateway.
 
 gateway.py reports events through gateway.ON_EVENT (set here, so the gateway
 never imports this module). Messages name the provider, a masked key and the
 agent, never prompts, message content or full keys. The same cause for the
-same provider is sent at most once every DEDUP seconds.
+same provider is sent at most once every DEDUP seconds. Every alert that goes
+out is appended to alert-history.jsonl.
+
+Bot commands (/status, /switch <provider>) are read with long polling and only
+accepted from the configured chat.
 """
 
+import datetime
 import json
 import os
 import queue
@@ -19,11 +24,15 @@ import urllib.request
 
 import gateway
 
-CONFIG_FILE = gateway.DATA_DIR / "telegram.json"   # {bot_token, chat_id, enabled, idle_minutes}
+CONFIG_FILE = gateway.DATA_DIR / "telegram.json"        # settings (see load())
+STATS_FILE = gateway.DATA_DIR / "alert-stats.json"      # per-agent counters since the last summary, quota warnings
+HISTORY_FILE = gateway.DATA_DIR / "alert-history.jsonl"  # every alert sent: time, provider, type, message
+MAX_HISTORY = 5000
 API = os.environ.get("ESKAGATE_TELEGRAM_API", "https://api.telegram.org")   # overridable for tests
 DEDUP = 300
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 CHAT_RE = re.compile(r"^(-?\d{3,}|@[A-Za-z0-9_]{5,})$")
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 REASON = {"invalid": "مرفوض (المفتاح غالط ولا تحيد)", "no_credit": "سالا الرصيد",
           "limited": "وصل للحد (rate limit)", "error": "المزود طايح ولا ما جاوبش"}
@@ -34,6 +43,8 @@ _last_sent = {}          # (scope, cause) -> time sent
 _failed_keys = {}        # (provider_id, key_id) -> cause, until that key works again
 _down = set()            # provider ids reported as fully down
 _clients = {}            # client name -> {"last": t, "active": n, "idle": bool}
+_last_chat = {}          # last chat that wrote to the bot (seen by the command poller)
+_poller = {"running": False}
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +56,20 @@ def load():
     except Exception:
         data = {}
     return {"bot_token": data.get("bot_token", ""), "chat_id": str(data.get("chat_id", "")),
-            "enabled": bool(data.get("enabled", True)), "idle_minutes": int(data.get("idle_minutes", 10))}
+            "enabled": bool(data.get("enabled", True)), "idle_minutes": int(data.get("idle_minutes", 10)),
+            "summary": bool(data.get("summary", True)), "summary_time": data.get("summary_time") or "09:00"}
 
 
 def public():
     c = load()
     return {"configured": bool(c["bot_token"] and c["chat_id"]), "enabled": c["enabled"],
             "bot_token": gateway.mask_key(c["bot_token"]), "chat_id": gateway.mask_key(c["chat_id"]),
-            "idle_minutes": c["idle_minutes"]}
+            "idle_minutes": c["idle_minutes"], "summary": c["summary"], "summary_time": c["summary_time"]}
+
+
+def _ready(c=None):
+    c = c or load()
+    return bool(c["enabled"] and c["bot_token"] and c["chat_id"])
 
 
 def _merged(data):
@@ -68,13 +85,19 @@ def _merged(data):
         if not CHAT_RE.match(chat):
             raise ValueError("الـ Chat ID خاصو يكون رقم (ولا @channel).")
         c["chat_id"] = chat
-    if "enabled" in data:
-        c["enabled"] = bool(data["enabled"])
+    for k in ("enabled", "summary"):
+        if k in data:
+            c[k] = bool(data[k])
     if "idle_minutes" in data:
         try:
             c["idle_minutes"] = max(0, min(int(data["idle_minutes"]), 1440))
         except (TypeError, ValueError):
             raise ValueError("عدد الدقايق خاصو يكون رقم.")
+    if data.get("summary_time"):
+        m = TIME_RE.match(str(data["summary_time"]).strip())
+        if not m:
+            raise ValueError("الوقت ديال الملخص خاصو يكون بحال 09:00.")
+        c["summary_time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
     return c
 
 
@@ -85,15 +108,50 @@ def save(data):
 
 
 # ---------------------------------------------------------------------------
-# Sending
+# Counters kept between restarts (daily summary, one quota warning per key per day)
 # ---------------------------------------------------------------------------
-def _call(token, method, payload=None):
+_stats = None
+
+
+def _load_stats():
+    global _stats
+    if _stats is None:
+        try:
+            _stats = json.loads(STATS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _stats = {}
+        _stats.setdefault("since", time.time())
+        _stats.setdefault("last_summary", "")
+        _stats.setdefault("agents", {})
+        _stats.setdefault("quota_warned", {})
+        _stats["dirty"] = False
+    return _stats
+
+
+_saved_at = [0.0]
+
+
+def _save_stats(force=False):
+    with _lock:
+        st = _load_stats()
+        if not (st.get("dirty") or force):
+            return
+        st["dirty"] = False
+        _saved_at[0] = time.time()
+        data = {k: v for k, v in st.items() if k != "dirty"}
+    gateway.write_private(STATS_FILE, json.dumps(data, indent=1, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# Sending + history
+# ---------------------------------------------------------------------------
+def _call(token, method, payload=None, timeout=15):
     """Telegram Bot API call. Errors never include the token (it is part of the URL)."""
     req = urllib.request.Request(f"{API}/bot{token}/{method}",
                                  data=json.dumps(payload or {}).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
@@ -122,6 +180,11 @@ def find_chat_id(data):
     c = _merged(data)
     if not c["bot_token"]:
         raise ValueError("كتب الـ Bot token بعدا.")
+    if _poller["running"] and _ready(c):
+        # The command poller already reads the updates (Telegram allows one reader at a time).
+        if _last_chat:
+            return dict(_last_chat)
+        raise ValueError("صيفط /start للبوت ديالك فـ Telegram، وعاود ضغط بعد شي ثواني.")
     res = _call(c["bot_token"], "getUpdates", {"limit": 20})
     for upd in reversed(res.get("result") or []):
         msg = upd.get("message") or upd.get("channel_post") or upd.get("my_chat_member") or {}
@@ -132,26 +195,66 @@ def find_chat_id(data):
     raise ValueError("ما لقيت حتى رسالة. صيفط /start للبوت ديالك فـ Telegram، وعاود.")
 
 
-def notify(scope, cause, text):
+def _log_history(item, sent, error=""):
+    entry = {"time": time.time(), "provider": item.get("provider", ""), "agent": item.get("agent", ""),
+             "type": item["type"], "message": item["text"], "sent": sent}
+    if error:
+        entry["error"] = error[:200]
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with _lock:
+        try:
+            gateway.ensure_data_dir()
+            if HISTORY_FILE.exists() and HISTORY_FILE.stat().st_size > 2_000_000:
+                lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines(True)[-MAX_HISTORY:]
+                gateway.write_private(HISTORY_FILE, "".join(lines) + line)
+            else:
+                fd = os.open(HISTORY_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except OSError:
+            pass
+
+
+def history(limit=MAX_HISTORY):
+    """Alerts sent, newest first."""
+    try:
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return sorted(out, key=lambda e: e.get("time", 0), reverse=True)
+
+
+def _enqueue(text, kind, provider="", agent=""):
+    _queue.put({"text": text, "type": kind, "provider": provider, "agent": agent})
+
+
+def notify(scope, cause, text, provider="", agent="", kind=None):
     """Queue an alert unless the same cause for the same scope was sent in the last DEDUP seconds."""
-    c = load()
-    if not (c["enabled"] and c["bot_token"] and c["chat_id"]):
+    if not _ready():
         return False
     now = time.time()
     with _lock:
         if now - _last_sent.get((scope, cause), 0) < DEDUP:
             return False
         _last_sent[(scope, cause)] = now
-    _queue.put(text)
+    _enqueue(text, kind or cause, provider, agent)
     return True
 
 
 def _sender():
     while True:
-        text = _queue.get()
+        item = _queue.get()
         try:
-            send_now(text)
+            send_now(item["text"])
+            _log_history(item, True)
         except Exception as e:
+            _log_history(item, False, str(e))
             sys.stderr.write(f"[alerts] {e}\n")
 
 
@@ -175,13 +278,16 @@ def _handle(kind, i):
         nxt = (f"↪️ دوزت للمفتاح {i['next_key']}." if i.get("next_key")
                else f"↪️ دوزت للمزود {i['next_provider']}." if i.get("next_provider")
                else "↪️ ما بقا حتى مفتاح آخر نجربو.")
-        notify(pid, i["reason"], f"⚠️ EskaGate · {name}\nالمفتاح {i['key']}: {REASON.get(i['reason'], i['reason'])}{code}.\n{nxt}")
+        quota = f"\n📊 آخر رقم صرح بيه المزود: {i['quota']}" if i.get("quota") else ""
+        notify(pid, i["reason"], f"⚠️ EskaGate · {name}\nالمفتاح {i['key']}: "
+               f"{REASON.get(i['reason'], i['reason'])}{code}.{quota}\n{nxt}", provider=name)
     elif kind == "provider_down":
         pid = i["provider_id"]
         with _lock:
             _down.add(pid)
         notify(pid, "down", f"🔴 EskaGate · {i['provider']}\nجميع المفاتيح ({i['keys']}) طايحين. "
-                            "الطلبات ما غاديش تدوز من هاد المزود حتى يرجع واحد فيهم.")
+                            "الطلبات ما غاديش تدوز من هاد المزود حتى يرجع واحد فيهم.",
+               provider=i["provider"], kind="provider_down")
     elif kind == "key_ok":
         pid, key = i["provider_id"], (i["provider_id"], i["key_id"])
         with _lock:
@@ -189,7 +295,37 @@ def _handle(kind, i):
             was_failed = _failed_keys.pop(key, None)
             _down.discard(pid)
         if was_down or was_failed:
-            notify(pid, "recovered", f"✅ EskaGate · {i['provider']}\nرجع كلشي عادي: المفتاح {i['key']} خدام.")
+            notify(pid, "recovered", f"✅ EskaGate · {i['provider']}\nرجع كلشي عادي: المفتاح {i['key']} خدام.",
+                   provider=i["provider"])
+    elif kind == "quota_low":
+        today = datetime.date.today().isoformat()
+        with _lock:
+            st = _load_stats()
+            if st["quota_warned"].get(i["key_id"]) == today or not _ready():
+                return
+            st["quota_warned"][i["key_id"]] = today
+            st["dirty"] = True
+        reset = f" كيرجع: {i['reset']}." if i.get("reset") else ""
+        pct = int(i["remaining"] * 100 / i["limit"]) if i.get("limit") else 0
+        _enqueue(f"🟠 EskaGate · {i['provider']}\nالمفتاح {i['key']} قرب يسالي: {i['bucket']} باقي "
+                 f"{i['remaining']} من {i['limit']} ({pct}%).{reset}\nهادا تنبيه قبل ما يطيح (مرة فالنهار لكل مفتاح).",
+                 "quota_low", provider=i["provider"])
+        _save_stats()
+    elif kind == "request_logged":
+        name = i.get("client") or "unknown"
+        if name in ("curl", "unknown"):
+            return
+        with _lock:
+            st = _load_stats()
+            a = st["agents"].setdefault(name, {"requests": 0, "tokens": 0, "switches": 0, "errors": 0})
+            a["requests"] += 1
+            a["tokens"] += int(i.get("tokens_in") or 0) + int(i.get("tokens_out") or 0)
+            a["switches"] += int(i.get("failovers") or 0)
+            a["errors"] += 1 if i.get("status") == "error" else 0
+            st["dirty"] = True
+            due = now - _saved_at[0] > 5
+        if due:                          # at most every 5 s, so a restart loses little
+            _save_stats()
     elif kind == "request":
         name = i.get("client") or "unknown"
         if name in ("curl", "unknown"):
@@ -201,13 +337,7 @@ def _handle(kind, i):
             woke = c["idle"]
             c["idle"] = False
         if woke:
-            notify("agent:" + name, "active", f"✅ EskaGate · {name}\nرجع كيبعث الطلبات.")
-
-
-def _idle_watch():
-    while True:
-        time.sleep(30)
-        check_idle()
+            notify("agent:" + name, "active", f"✅ EskaGate · {name}\nرجع كيبعث الطلبات.", agent=name)
 
 
 def check_idle(now=None):
@@ -223,10 +353,122 @@ def check_idle(now=None):
             _clients[n]["idle"] = True
     for n, last in quiet:
         notify("agent:" + n, "idle", f"💤 EskaGate · {n}\nما بعث حتى طلب هادي {minutes} دقيقة "
-                                     f"(آخر طلب {time.strftime('%H:%M', time.localtime(last))}).")
+                                     f"(آخر طلب {time.strftime('%H:%M', time.localtime(last))}).", agent=n)
+
+
+# ---------------------------------------------------------------------------
+# Daily summary: one message per agent that had traffic since the last one
+# ---------------------------------------------------------------------------
+def _fmt_tokens(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.1f}k" if n >= 1e4 else str(n)
+
+
+def check_summary(now=None):
+    """Sends the summary once a day, at or after summary_time (local), if it wasn't sent today."""
+    c = load()
+    if not (c["summary"] and _ready(c)):
+        return False
+    dt = datetime.datetime.fromtimestamp(now or time.time())
+    if dt.strftime("%H:%M") < c["summary_time"]:
+        return False
+    today = dt.date().isoformat()
+    with _lock:
+        st = _load_stats()
+        if st["last_summary"] == today:
+            return False
+        agents, since = st["agents"], st["since"]
+        st.update(agents={}, since=dt.timestamp(), last_summary=today, dirty=True)
+    start = time.strftime("%d/%m %H:%M", time.localtime(since))
+    for name, a in sorted(agents.items(), key=lambda x: -x[1]["requests"]):
+        if not a["requests"]:
+            continue
+        errors = f" · {a['errors']} خطأ" if a.get("errors") else ""
+        _enqueue(f"📊 EskaGate · الملخص اليومي · {name}\nمن {start}: {a['requests']} طلب · "
+                 f"{_fmt_tokens(a['tokens'])} token · {a['switches']} تبديل ديال المفتاح{errors}",
+                 "summary", agent=name)
+    _save_stats(force=True)
+    return True
+
+
+def _ticker():
+    while True:
+        time.sleep(10)
+        for job in (check_idle, check_summary, _save_stats):
+            try:
+                job()
+            except Exception as e:
+                sys.stderr.write(f"[alerts] {type(e).__name__}: {e}\n")
+
+
+# ---------------------------------------------------------------------------
+# Bot commands (long polling). Only the configured chat is answered.
+# ---------------------------------------------------------------------------
+HELP = ("🤖 EskaGate\n/status: الحالة ديال كل مزود\n/switch <provider>: دير المفتاح الجاي هو ★ ديال هاد المزود")
+
+
+def handle_command(text):
+    """Reply text for a bot command."""
+    parts = (text or "").strip().split(None, 1)
+    cmd = parts[0].split("@", 1)[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if cmd == "/status":
+        lines = gateway.provider_status_lines()
+        return "📋 EskaGate\n" + ("\n".join(lines) if lines else "ما كاين حتى مزود.")
+    if cmd == "/switch":
+        if not arg:
+            names = ", ".join(p["name"] for p in gateway.store().providers()) or "—"
+            return f"كتب اسم المزود: /switch <provider>\nالمزودين: {names}"
+        try:
+            p, old, new = gateway.switch_active_key(arg)
+        except ValueError as e:
+            msg = {"Unknown provider.": f"ما كاينش مزود سميتو «{arg}».",
+                   "No other available key.": f"«{arg}»: ما كاين حتى مفتاح آخر واجد (كلهم كيرتاحو ولا مرفوضين)."}
+            return "❌ " + msg.get(str(e), str(e))
+        was = gateway.mask_key(old["key"]) if old else "—"
+        return f"✅ {p['name']}: ★ ولا {gateway.mask_key(new['key'])} (كان {was})."
+    return HELP
+
+
+def _poll():
+    offset, started = None, time.time()
+    while True:
+        c = load()
+        if not _ready(c):
+            _poller["running"] = False
+            offset = None
+            time.sleep(5)
+            continue
+        _poller["running"] = True
+        try:
+            res = _call(c["bot_token"], "getUpdates",
+                        {"timeout": 25, "allowed_updates": ["message"], **({"offset": offset} if offset else {})},
+                        timeout=40)
+        except ValueError as e:
+            sys.stderr.write(f"[alerts] poll: {e}\n")
+            time.sleep(30 if "Conflict" in str(e) else 5)
+            continue
+        for upd in res.get("result") or []:
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or {}
+            chat = msg.get("chat") or {}
+            if chat.get("id") is None:
+                continue
+            _last_chat.update(chat_id=str(chat["id"]),
+                              name=chat.get("title") or chat.get("first_name") or chat.get("username") or "")
+            mine = str(chat["id"]) == c["chat_id"] or ("@" + str(chat.get("username") or "")) == c["chat_id"]
+            if not mine or msg.get("date", 0) < started - 60 or not str(msg.get("text", "")).startswith("/"):
+                continue                 # other chats are ignored; old commands from before start are skipped
+            try:
+                reply = handle_command(msg["text"])
+            except Exception as e:
+                reply = f"❌ {type(e).__name__}"
+            try:
+                _call(c["bot_token"], "sendMessage", {"chat_id": chat["id"], "text": reply})
+            except ValueError as e:
+                sys.stderr.write(f"[alerts] reply: {e}\n")
 
 
 def start():
     gateway.ON_EVENT = on_event
-    threading.Thread(target=_sender, daemon=True, name="alerts-send").start()
-    threading.Thread(target=_idle_watch, daemon=True, name="alerts-idle").start()
+    for target, name in ((_sender, "alerts-send"), (_ticker, "alerts-tick"), (_poll, "alerts-poll")):
+        threading.Thread(target=target, daemon=True, name=name).start()
