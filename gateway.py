@@ -24,6 +24,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import i18n
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
@@ -1197,15 +1199,15 @@ def save_provider(data):
     name = (data.get("name") or "").strip()
     base_url = (data.get("base_url") or "").strip().rstrip("/")
     if not name or not base_url.lower().startswith(("http://", "https://")):
-        raise ValueError("Name and a base URL starting with http:// or https:// are required.")
+        raise ValueError(i18n.t("err.provider_required"))
     if "/" in name:
-        raise ValueError("The provider name cannot contain '/'.")
+        raise ValueError(i18n.t("err.provider_slash"))
     fmt = data.get("format") if data.get("format") in ("openai", "anthropic") else "openai"
     manual = [m.strip() for m in str(data.get("manual_models") or "").split(",") if m.strip()]
     with st.lock:
         dup = next((p for p in st.providers() if p["name"].lower() == name.lower() and p["id"] != data.get("id")), None)
         if dup:
-            raise ValueError(f"A provider named '{name}' already exists.")
+            raise ValueError(i18n.t("err.provider_exists", name=name))
         p = st.provider(data.get("id")) if data.get("id") else None
         if p is None:
             p = {"id": new_id("prov_"), "keys": [], "models": [], "enabled": True}
@@ -1251,7 +1253,7 @@ def add_keys(pid, text, label=""):
     with st.lock:
         p = st.provider(pid)
         if not p:
-            raise ValueError("Unknown provider.")
+            raise ValueError(i18n.t("err.unknown_provider"))
         report = check_keys(text)
         where = {k["key"] for q in st.providers() for k in q.get("keys", [])}
         added = 0
@@ -1305,7 +1307,7 @@ def _test_one_key(p, k, tester):
         if not test_models:
             kind, _ = classify(0, {"error": {"message": err or ""}})
             return {"status": kind if kind in COOLDOWN else "error", "models": [],
-                    "error": err or "No model list: add models manually."}
+                    "error": err or i18n.t("err.no_model_list")}
         base = p["base_url"].rstrip("/")
         r = tester["test_model"](test_models[0], base + "/chat/completions" if not base.endswith("/chat/completions")
                                  else base, headers, timeout, 0, "ping", 1, False)
@@ -1326,7 +1328,7 @@ def _test_one_key(p, k, tester):
     test_models = list(p.get("manual_models") or []) + models
     if not test_models:
         kind = "invalid" if status in (401, 403) else "error"
-        return {"status": kind, "models": [], "error": short_error(res) or "No model list: add models manually."}
+        return {"status": kind, "models": [], "error": short_error(res) or i18n.t("err.no_model_list")}
     status, res = tester["make_request"](upstream_url(p, "anthropic"), headers,
                                          {"model": test_models[0], "max_tokens": 8,
                                           "messages": [{"role": "user", "content": "ping"}]}, timeout)
@@ -1341,10 +1343,10 @@ def test_provider_keys(pid, tester):
     st = store()
     p = st.provider(pid)
     if not p:
-        raise ValueError("Unknown provider.")
+        raise ValueError(i18n.t("err.unknown_provider"))
     keys = list(p["keys"])
     if not keys:
-        raise ValueError("Add at least one key first.")
+        raise ValueError(i18n.t("err.no_keys"))
     with ThreadPoolExecutor(max_workers=min(8, len(keys))) as ex:
         results = list(ex.map(lambda k: _test_one_key(p, k, tester), keys))
     with st.lock:

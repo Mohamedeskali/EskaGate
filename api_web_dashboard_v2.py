@@ -19,6 +19,7 @@ capabilities، إلخ) لسيرفر محلي صغير:
     وبعدها حل المتصفح على: http://localhost:8000
 """
 
+import html
 import json
 import re
 import sys
@@ -36,6 +37,7 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gateway  # noqa: E402  (local AI gateway: providers, local key, /v1 endpoints)
+import i18n     # noqa: E402  (translations: i18n/<lang>.json + the saved UI language)
 import agents   # noqa: E402  (Claude Code / opencode / pi / Hermes config switching)
 import alerts   # noqa: E402  (Telegram alerts from gateway events)
 import phone    # noqa: E402  (phone access over the home Wi-Fi, token-protected)
@@ -227,22 +229,22 @@ def diagnose_failure(code, res):
     raw = error_message(res)
     text = raw.lower()
     if code in (401, 403) or any(term in text for term in ("invalid api key", "invalid key", "unauthorized", "authentication", "forbidden")):
-        return "KEY_INVALID", "المفتاح غير صالح أو لا يملك صلاحية استعمال هذه الخدمة.", raw
+        return "KEY_INVALID", i18n.t("srv.diag.KEY_INVALID"), raw
     if code == 429 or any(term in text for term in ("rate limit", "too many requests", "quota", "insufficient balance", "credit")):
-        return "LIMITED", "تم بلوغ حدّ الطلبات أو الرصيد؛ لا يمكن الحكم على الموديل الآن.", raw
+        return "LIMITED", i18n.t("srv.diag.LIMITED"), raw
     if code == 0:
         if "timed out" in text or "timeout" in text:
-            return "UNAVAILABLE", "انتهت مهلة الاتصال قبل وصول رد من الخدمة.", raw
-        return "UNAVAILABLE", "تعذر الاتصال بالخدمة؛ تحقق من الرابط والإنترنت وحالة المزود.", raw
+            return "UNAVAILABLE", i18n.t("srv.diag.TIMEOUT"), raw
+        return "UNAVAILABLE", i18n.t("srv.diag.UNREACHABLE"), raw
     if code >= 500:
-        return "UNAVAILABLE", "الخدمة لدى المزود غير متاحة مؤقتًا؛ أعد المحاولة لاحقًا.", raw
+        return "UNAVAILABLE", i18n.t("srv.diag.SERVER"), raw
     if code == 404 or any(term in text for term in ("model not found", "unknown model", "does not exist", "not available")):
-        return "MODEL_UNAVAILABLE", "هذا الموديل غير متاح لهذا المفتاح أو اسمه غير صحيح.", raw
+        return "MODEL_UNAVAILABLE", i18n.t("srv.diag.MODEL_UNAVAILABLE"), raw
     if code == 400:
-        return "INCOMPATIBLE", "رفض المزود صيغة طلب الاختبار؛ قد لا يدعم واجهة الدردشة المتوافقة.", raw
+        return "INCOMPATIBLE", i18n.t("srv.diag.INCOMPATIBLE"), raw
     if code == 200:
-        return "INVALID_RESPONSE", "وصل رد ناجح لكن لا يحتوي على إجابة دردشة مفهومة.", raw
-    return "FAILED", f"فشل طلب الاختبار (HTTP {code}).", raw
+        return "INVALID_RESPONSE", i18n.t("srv.diag.INVALID_RESPONSE"), raw
+    return "FAILED", i18n.t("srv.diag.FAILED", code=code), raw
 
 
 def response_has_text(choice):
@@ -401,7 +403,7 @@ def fetch_models_list(base_url, headers, timeout, retries, emit=None):
     errors = []
     for url in candidates:
         if emit:
-            emit("status", {"message": f"كنجرب لائحة الموديلات: {url}"})
+            emit("status", {"message": i18n.t("srv.trying_list", url=url)})
         # Retries still cover 429/5xx and dropped connections, but a timeout is
         # not retried: a dead host would otherwise cost (retries+1) x timeout.
         status, res = make_request_with_retry(
@@ -412,7 +414,7 @@ def fetch_models_list(base_url, headers, timeout, retries, emit=None):
             models = extract_models_from_response(res)
             if models:
                 return models, None
-            errors.append(f"{url}: HTTP 200 لكن صيغة لائحة الموديلات غير مفهومة")
+            errors.append(i18n.t("srv.list_unreadable", url=url))
         else:
             if isinstance(res, dict):
                 err = res.get("error", "Unknown error")
@@ -449,11 +451,11 @@ def run_pipeline(params, emit):
     api_key = (params.get("api_key") or "").strip()
 
     if not base_url or not api_key:
-        emit("error", {"message": "Base URL و API Key خاصهم يكونو معمرين."})
+        emit("error", {"message": i18n.t("srv.need_url_key")})
         return
 
     if not re.match(r"^https?://[^/]+", base_url, re.IGNORECASE):
-        emit("error", {"message": "Base URL خاصو يبدا بـ http:// أو https://."})
+        emit("error", {"message": i18n.t("srv.bad_scheme")})
         return
 
     # Accept a complete chat URL too; internally the dashboard always needs
@@ -470,11 +472,11 @@ def run_pipeline(params, emit):
         workers = int(params.get("workers") or 8)
         repeat = int(params.get("repeat") or 1)
     except (TypeError, ValueError):
-        emit("error", {"message": "Timeout و Retries و Workers و Repeat خاصهم يكونو أرقام صحيحة."})
+        emit("error", {"message": i18n.t("srv.not_numbers")})
         return
 
     if timeout <= 0 or retries < 0 or workers <= 0 or repeat <= 0:
-        emit("error", {"message": "Timeout و Workers و Repeat خاصهم يكونو أكبر من صفر، و Retries ما يقدرش يكون سالب."})
+        emit("error", {"message": i18n.t("srv.bad_ranges")})
         return
     # Prevent an accidental value in the form from exhausting the local machine.
     workers = min(workers, 32)
@@ -495,22 +497,18 @@ def run_pipeline(params, emit):
     models_list = []
     if manual_models.strip():
         models_list = list(dict.fromkeys(m.strip() for m in manual_models.split(",") if m.strip()))
-        emit("status", {"message": f"استعمال {len(models_list)} موديل مُدخلين يدوياً."})
+        emit("status", {"message": i18n.t("srv.manual_models", n=len(models_list))})
     else:
-        emit("status", {"message": "كنجيب لائحة الموديلات المتوفرة..."})
+        emit("status", {"message": i18n.t("srv.fetching")})
         models_list, fetch_err = fetch_models_list(base_url, headers, timeout, retries, emit=emit)
 
         if models_list:
-            emit("status", {"message": f"تم العثور على {len(models_list)} موديل."})
+            emit("status", {"message": i18n.t("srv.found", n=len(models_list))})
         elif fallback_models:
             models_list = [m for m in fallback_models if isinstance(m, str) and m.strip()]
-            emit("status", {
-                "message": f"⚠️ ما قدرتش نجيب لائحة محدثة ({fetch_err}) — "
-                           f"كنستعمل آخر {len(models_list)} موديل معروفين من فحص سابق ناجح."
-            })
+            emit("status", {"message": i18n.t("srv.fallback", error=fetch_err, n=len(models_list))})
         else:
-            emit("error", {"message": f"ما قدرتش نجيب الموديلات تلقائياً ({fetch_err}). "
-                                       "دخل أسماء الموديلات يدوياً فالحقل المخصص وعاود جرب."})
+            emit("error", {"message": i18n.t("srv.fetch_failed", error=fetch_err)})
             return
 
     if filter_regex:
@@ -518,13 +516,13 @@ def run_pipeline(params, emit):
             pattern = re.compile(filter_regex)
             before = len(models_list)
             models_list = [m for m in models_list if pattern.search(m)]
-            emit("status", {"message": f"الفلتر '{filter_regex}' طابق {len(models_list)}/{before}."})
+            emit("status", {"message": i18n.t("srv.filter_matched", filter=filter_regex, n=len(models_list), before=before)})
         except re.error as e:
-            emit("error", {"message": f"Regex ديال الفلتر خاطئ: {e}"})
+            emit("error", {"message": i18n.t("srv.bad_regex", error=e)})
             return
 
     if not models_list:
-        emit("error", {"message": "ما كاين حتى موديل باش نتستيوه."})
+        emit("error", {"message": i18n.t("srv.no_models")})
         return
 
     emit("models_found", {"count": len(models_list), "models": models_list})
@@ -548,7 +546,7 @@ def run_pipeline(params, emit):
             except Exception as e:
                 # A bad provider response for one model must not abort the full batch.
                 r = {"model": model, "status": "FAILED", "code": 0,
-                     "error": "حدث خطأ غير متوقع أثناء اختبار هذا الموديل.",
+                     "error": i18n.t("srv.model_crash"),
                      "technical_error": str(e)}
             results.append(r)
             emit("model_result", r)  # <-- كتبعث لصفحة الويب فالحين، بلا ما تسنى الباقي
@@ -567,16 +565,16 @@ def run_pipeline(params, emit):
 
     if working:
         key_status = "VALID"
-        key_message = "المفتاح يعمل: تم الحصول على استجابة دردشة ناجحة من موديل واحد على الأقل."
+        key_message = i18n.t("srv.key.VALID")
     elif any(r["status"] == "KEY_INVALID" for r in failed):
         key_status = "INVALID"
-        key_message = "المفتاح مرفوض أو لا يملك صلاحية استخدام النماذج المختبرة."
+        key_message = i18n.t("srv.key.INVALID")
     elif any(r["status"] == "LIMITED" for r in failed):
         key_status = "LIMITED"
-        key_message = "لا يمكن تأكيد صلاحية المفتاح الآن بسبب حدّ الاستخدام أو الرصيد."
+        key_message = i18n.t("srv.key.LIMITED")
     else:
         key_status = "UNCONFIRMED"
-        key_message = "تعذر تأكيد المفتاح؛ راجع تشخيص كل موديل والرابط المستخدم."
+        key_message = i18n.t("srv.key.UNCONFIRMED")
 
     config_data = build_opencode_config(provider_id, base_url, working_sorted) if working_sorted else None
 
@@ -595,7 +593,7 @@ def run_pipeline(params, emit):
 # ===========================================================================
 INDEX_HTML = r"""
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="{{i18n:lang}}" dir="{{i18n:dir}}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -695,7 +693,7 @@ INDEX_HTML = r"""
   }
   header .titles h1 { font-size: 16px; font-weight: 750; margin: 0; letter-spacing: .2px; }
   header .titles p { margin: 1px 0 0; color: var(--muted); font-size: 12px; }
-  header .top-actions { margin-right: auto; display: flex; gap: 8px; align-items: center; }
+  header .top-actions { margin-inline-start: auto; display: flex; gap: 8px; align-items: center; }
 
   .icon-btn {
     width: 38px; height: 38px; border-radius: 10px; border: 1px solid var(--line);
@@ -705,8 +703,12 @@ INDEX_HTML = r"""
   }
   .icon-btn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
   .icon-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
-  .icon-btn .dot { position: absolute; top: -4px; left: -4px; width: 12px; height: 12px; border-radius: 50%; background: var(--bad); border: 2px solid var(--surface); display: none; }
+  .icon-btn .dot { position: absolute; top: -4px; inset-inline-end: -4px; width: 12px; height: 12px; border-radius: 50%; background: var(--bad); border: 2px solid var(--surface); display: none; }
   .icon-btn.has-alert .dot { display: block; }
+  .lang-select { height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+    font: inherit; font-size: 12.5px; padding: 0 8px; cursor: pointer; transition: var(--trans); }
+  .lang-select:hover, .lang-select:focus { border-color: var(--accent); outline: none; }
+  @media (max-width: 700px) { .lang-select { display: none; } }   /* still in ⚙️ settings */
 
   /* ---------- APP LAYOUT ---------- */
   .app { max-width: 1600px; margin: 0 auto; padding: 18px clamp(12px, 2.5vw, 26px) 60px; }
@@ -917,9 +919,9 @@ INDEX_HTML = r"""
     display: flex; align-items: center; gap: 10px;
     color: var(--muted); font-size: 13px; margin-bottom: 16px;
     padding: 11px 15px; background: var(--surface); border: 1px solid var(--line);
-    border-radius: var(--radius-sm); border-right: 3px solid var(--line);
+    border-radius: var(--radius-sm); border-inline-start: 3px solid var(--line);
   }
-  .status-line.err { border-right-color: var(--bad); color: var(--bad); background: var(--bad-soft); }
+  .status-line.err { border-inline-start-color: var(--bad); color: var(--bad); background: var(--bad-soft); }
   .status-line .spin { width:14px; height:14px; border:2px solid var(--line); border-top-color: var(--accent); border-radius:50%; animation: rot .7s linear infinite; display:none; }
   .status-line.busy .spin { display: inline-block; }
   @keyframes rot { to { transform: rotate(360deg); } }
@@ -927,7 +929,7 @@ INDEX_HTML = r"""
   /* ---------- RESULTS TABLE ---------- */
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    text-align: right; color: var(--muted); font-weight: 700; font-size: 12px;
+    text-align: start; color: var(--muted); font-weight: 700; font-size: 12px;
     padding: 12px 14px; border-bottom: 1px solid var(--line); white-space: nowrap;
     position: sticky; top: 0; background: var(--surface-2); z-index: 2;
   }
@@ -1011,10 +1013,10 @@ INDEX_HTML = r"""
   .key-card::before {
     content: '';
     position: absolute;
-    inset: 0 auto 0 0;
+    inset-block: 0; inset-inline-end: 0;
     width: 3px;
     background: var(--faint);
-    border-radius: 12px 0 0 12px;
+    border-start-end-radius: 12px; border-end-end-radius: 12px;
   }
   .key-card.ok::before { background: var(--ok); }
   .key-card.bad::before { background: var(--bad); }
@@ -1069,7 +1071,7 @@ INDEX_HTML = r"""
     display: flex;
     align-items: center;
     gap: 5px;
-    margin-right: auto;
+    margin-inline-start: auto;
     font-size: 10px;
     color: var(--muted);
     white-space: nowrap;
@@ -1238,7 +1240,7 @@ INDEX_HTML = r"""
   .copy-dd .dd-menu {
     display: none;
     position: absolute;
-    right: 0;
+    inset-inline-start: 0;
     top: calc(100% + 4px);
     min-width: 170px;
     background: var(--surface);
@@ -1262,7 +1264,7 @@ INDEX_HTML = r"""
     background: transparent;
     color: var(--text);
     cursor: pointer;
-    text-align: right;
+    text-align: start;
     transition: var(--trans);
   }
   .copy-dd .dd-item:hover:not(:disabled) {
@@ -1306,16 +1308,19 @@ INDEX_HTML = r"""
   .empty-state .em { font-size: 40px; display:block; margin-bottom: 10px; opacity:.6; }
 
   /* ---------- TOASTS ---------- */
-  #toasts { position: fixed; bottom: 18px; left: 18px; z-index: 300; display: flex; flex-direction: column; gap: 10px; width: min(340px, calc(100vw - 36px)); }
+  #toasts { position: fixed; bottom: 18px; inset-inline-end: 18px; z-index: 300; display: flex; flex-direction: column; gap: 10px; width: min(340px, calc(100vw - 36px)); }
   .toast {
-    background: var(--surface-3); border: 1px solid var(--line); border-right: 4px solid var(--accent);
+    background: var(--surface-3); border: 1px solid var(--line); border-inline-start: 4px solid var(--accent);
     border-radius: var(--radius-sm); padding: 12px 14px; box-shadow: var(--shadow);
     animation: slidein .25s ease; font-size: 12.5px;
   }
-  @keyframes slidein { from { opacity:0; transform: translateX(-16px); } to { opacity:1; transform:none; } }
-  .toast.ok { border-right-color: var(--ok); }
-  .toast.bad { border-right-color: var(--bad); }
-  .toast.warn { border-right-color: var(--warn); }
+  @keyframes slidein { from { opacity:0; transform: translateX(var(--slide-x)); } to { opacity:1; transform:none; } }
+  .toast.ok { border-inline-start-color: var(--ok); }
+  .toast.bad { border-inline-start-color: var(--bad); }
+  .toast.warn { border-inline-start-color: var(--warn); }
+  /* toasts sit on the inline-end side and slide in from the page edge */
+  :root { --slide-x: -16px; }
+  [dir="ltr"] { --slide-x: 16px; }
   .toast .t-title { font-weight: 800; font-size: 13px; margin-bottom: 3px; display:flex; align-items:center; gap:7px; }
   .toast .t-body { color: var(--muted); line-height: 1.4; }
 
@@ -1325,9 +1330,9 @@ INDEX_HTML = r"""
   .setting-row .s-label { font-weight: 700; font-size: 13.5px; }
   .setting-row .s-sub { color: var(--muted); font-size: 11.5px; }
   .toggle { width: 46px; height: 26px; border-radius: 20px; background: var(--surface-3); border:1px solid var(--line); position:relative; cursor:pointer; transition: var(--trans); flex-shrink:0; }
-  .toggle::after { content:''; position:absolute; top:2px; right:2px; width:20px; height:20px; border-radius:50%; background: var(--muted); transition: var(--trans); }
+  .toggle::after { content:''; position:absolute; top:2px; inset-inline-start:2px; width:20px; height:20px; border-radius:50%; background: var(--muted); transition: var(--trans); }
   .toggle.on { background: var(--accent-soft); border-color: var(--accent); }
-  .toggle.on::after { background: var(--accent); right: calc(100% - 22px); }
+  .toggle.on::after { background: var(--accent); inset-inline-start: calc(100% - 22px); }
   .theme-seg { display:inline-flex; background: var(--surface-2); border:1px solid var(--line); border-radius:9px; padding:3px; gap:2px; }
   .theme-seg button { border:none; background:transparent; color:var(--muted); font:inherit; font-size:12px; padding:6px 14px; border-radius:6px; cursor:pointer; transition:var(--trans); }
   .theme-seg button.on { background: var(--surface); color: var(--text); font-weight:700; box-shadow: var(--shadow-sm); }
@@ -1406,7 +1411,7 @@ INDEX_HTML = r"""
   .result-banner .txt span { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
   .result-banner .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .result-banner .actions .ghost, .result-banner .actions .dd-btn { width: auto; padding: 9px 14px; }
-  .result-banner .dd-menu { bottom: auto; top: calc(100% + 8px); left: 0; right: auto; min-width: 220px; }
+  .result-banner .dd-menu { bottom: auto; top: calc(100% + 8px); inset-inline-end: 0; inset-inline-start: auto; min-width: 220px; }
 
   /* ---------- RESULT FILTERS ---------- */
   .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1593,7 +1598,7 @@ INDEX_HTML = r"""
   .mdd { position: relative; }
   .mdd-field { display:flex; align-items:center; gap:8px; width:100%; background:var(--surface-2); border:1px solid var(--line);
     color:var(--text); border-radius:var(--radius-sm); padding:9px 10px; font-family:var(--font-mono); font-size:12px;
-    cursor:pointer; text-align:right; transition:var(--trans); }
+    cursor:pointer; text-align:start; transition:var(--trans); }
   .mdd-field:hover:not(:disabled), .mdd.open .mdd-field { border-color:var(--accent); }
   .mdd-field:disabled { opacity:.5; cursor:not-allowed; }
   .mdd-field .mdd-val { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1611,7 +1616,7 @@ INDEX_HTML = r"""
   .mdd-row:hover { background:var(--surface-3); }
   .mdd-row.sel { background:var(--accent-soft); color:var(--accent); font-weight:700; }
   .mdd-row input { width:14px; height:14px; margin:0; accent-color:var(--accent); flex-shrink:0; cursor:pointer; }
-  .mdd-row .mdd-name { flex:1; min-width:0; overflow-wrap:anywhere; text-align:right; }
+  .mdd-row .mdd-name { flex:1; min-width:0; overflow-wrap:anywhere; text-align:start; }
   .mdd-empty { padding:12px; color:var(--muted); font-size:12px; text-align:center; }
   .mdd-foot { display:flex; align-items:center; gap:6px; padding:7px 10px; border-top:1px solid var(--line); background:var(--surface-2); font-size:11px; color:var(--muted); }
   .mdd-foot .mdd-count { flex:1; }
@@ -1698,28 +1703,31 @@ INDEX_HTML = r"""
   <div class="logo"><svg width="40" height="40" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"> <defs> <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"> <stop offset="0" stop-color="#6D8BFF"/><stop offset="1" stop-color="#9B6DFF"/> </linearGradient> </defs> <rect width="64" height="64" rx="15" fill="url(#bg)"/> <g fill="#fff"> <rect x="15" y="14" width="8" height="36" rx="2.5"/> <rect x="15" y="14" width="32" height="8" rx="2.5"/> <rect x="15" y="42" width="32" height="8" rx="2.5"/> </g> <g fill="#3EE6A8"> <rect x="26" y="28" width="12" height="8" rx="2.5"/> <path d="M36 23.5 L49.5 32 L36 40.5 Z" stroke="#3EE6A8" stroke-width="2" stroke-linejoin="round"/> </g> </svg></div>
   <div class="titles">
     <h1>EskaGate</h1>
-    <p>مراقبة حية للاختبارات + ملاحظة دورية لكل المفاتيح المربوطة</p>
+    <p>{{t:app.tagline}}</p>
   </div>
   <div class="top-actions">
-    <button class="icon-btn" id="toastToggleBtn" title="تشغيل/إيقاف الإشعارات" onclick="toggleToasts()">🔔</button>
-    <button class="icon-btn" id="themeToggleBtn" title="تبديل الوضع الفاتح/الداكن" onclick="toggleTheme()">🌙</button>
-    <button class="icon-btn" title="مفاتيحي والمراقبة" onclick="showTab('keys')">🔑</button>
-    <button class="icon-btn" title="الإعدادات" onclick="openSettings()">⚙️</button>
+    <select class="lang-select" id="langSelect" title="{{t:settings.lang}}" aria-label="{{t:settings.lang}}" onchange="setLang(this.value)">
+      <option value="ar">{{t:lang.ar}}</option><option value="en">{{t:lang.en}}</option><option value="fr">{{t:lang.fr}}</option>
+    </select>
+    <button class="icon-btn" id="toastToggleBtn" title="{{t:hdr.toasts}}" onclick="toggleToasts()">🔔</button>
+    <button class="icon-btn" id="themeToggleBtn" title="{{t:hdr.theme}}" onclick="toggleTheme()">🌙</button>
+    <button class="icon-btn" title="{{t:nav.keys}}" onclick="showTab('keys')">🔑</button>
+    <button class="icon-btn" title="{{t:hdr.settings}}" onclick="openSettings()">⚙️</button>
     <button class="icon-btn" id="phoneBtn" title="فتح من التيليفون (نفس الـ Wi-Fi)" onclick="openPhone()">📱</button>
   </div>
 </header>
 
-<button class="to-top" id="toTop" title="رجوع للفوق" onclick="window.scrollTo({ top: 0, behavior: 'smooth' })">⬆</button>
+<button class="to-top" id="toTop" title="{{t:app.to_top}}" onclick="window.scrollTo({ top: 0, behavior: 'smooth' })">⬆</button>
 <div class="app">
 
   <!-- ============ TABS ============ -->
   <nav class="tabs" role="tablist" aria-orientation="vertical">
-    <button class="nav-toggle" id="navToggle" type="button" onclick="toggleNav()" title="صغّر / كبّر الشريط" aria-expanded="true">☰</button>
-    <button class="tab-btn on" id="tabBtn-test" role="tab" title="اختبار" onclick="showTab('test')"><span class="ic">🧪</span><span class="lbl">اختبار</span></button>
-    <button class="tab-btn" id="tabBtn-keys" role="tab" title="مفاتيحي والمراقبة" onclick="showTab('keys')"><span class="ic">🔑</span><span class="lbl">مفاتيحي والمراقبة</span><span class="count" id="statKeys">0</span></button>
-    <button class="tab-btn" id="tabBtn-providers" role="tab" title="المزودين" onclick="showTab('providers')"><span class="ic">🔌</span><span class="lbl">المزودين</span></button>
-    <button class="tab-btn" id="tabBtn-gateway" role="tab" title="Gateway" onclick="showTab('gateway')"><span class="ic">🚪</span><span class="lbl">Gateway</span></button>
-    <button class="tab-btn" id="tabBtn-agents" role="tab" title="الوكلاء" onclick="showTab('agents')"><span class="ic">🤖</span><span class="lbl">الوكلاء</span></button>
+    <button class="nav-toggle" id="navToggle" type="button" onclick="toggleNav()" title="{{t:nav.toggle}}" aria-expanded="true">☰</button>
+    <button class="tab-btn on" id="tabBtn-test" role="tab" title="{{t:nav.test}}" onclick="showTab('test')"><span class="ic">🧪</span><span class="lbl">{{t:nav.test}}</span></button>
+    <button class="tab-btn" id="tabBtn-keys" role="tab" title="{{t:nav.keys}}" onclick="showTab('keys')"><span class="ic">🔑</span><span class="lbl">{{t:nav.keys_short}}</span><span class="count" id="statKeys">0</span></button>
+    <button class="tab-btn" id="tabBtn-providers" role="tab" title="{{t:nav.providers}}" onclick="showTab('providers')"><span class="ic">🔌</span><span class="lbl">{{t:nav.providers}}</span></button>
+    <button class="tab-btn" id="tabBtn-gateway" role="tab" title="{{t:nav.gateway}}" onclick="showTab('gateway')"><span class="ic">🚪</span><span class="lbl">{{t:nav.gateway}}</span></button>
+    <button class="tab-btn" id="tabBtn-agents" role="tab" title="{{t:nav.agents}}" onclick="showTab('agents')"><span class="ic">🤖</span><span class="lbl">{{t:nav.agents}}</span></button>
   </nav>
 
   <!-- ================================================================
@@ -1729,51 +1737,51 @@ INDEX_HTML = r"""
 
     <!-- TOP STATS -->
     <div class="stat-strip">
-      <div class="stat ok"><div class="num" id="statWorking">0</div><div class="label">✅ موديل خدام</div></div>
-      <div class="stat bad"><div class="num" id="statFailed">0</div><div class="label">⛔ فشل</div></div>
-      <div class="stat accent"><div class="num" id="statTotal">0</div><div class="label">مجموع الموديلات</div></div>
-      <div class="stat"><div class="num" id="statTime">0s</div><div class="label">⏱ الوقت الكلي</div></div>
+      <div class="stat ok"><div class="num" id="statWorking">0</div><div class="label">{{t:test.stat_working}}</div></div>
+      <div class="stat bad"><div class="num" id="statFailed">0</div><div class="label">{{t:test.stat_failed}}</div></div>
+      <div class="stat accent"><div class="num" id="statTotal">0</div><div class="label">{{t:test.stat_total}}</div></div>
+      <div class="stat"><div class="num" id="statTime">0s</div><div class="label">{{t:test.stat_time}}</div></div>
     </div>
 
     <div class="test-layout">
       <!-- ---------- SETUP COLUMN ---------- -->
       <aside class="setup-col">
         <section class="control-panel connection-panel">
-          <div class="control-panel-title"><span>🔌 الاتصال</span></div>
+          <div class="control-panel-title"><span>{{t:test.connection}}</span></div>
           <div class="field">
             <label>Base URL</label>
             <div class="input-with-btn">
               <input id="base_url" dir="ltr" placeholder="https://api.example.com/v1">
-              <button type="button" class="btn-icon" title="لصق" onclick="pasteInto('base_url')">📥</button>
-              <button type="button" class="btn-icon" title="نسخ" onclick="copyField('base_url', this)">📋</button>
+              <button type="button" class="btn-icon" title="{{t:common.paste}}" onclick="pasteInto('base_url')">📥</button>
+              <button type="button" class="btn-icon" title="{{t:common.copy}}" onclick="copyField('base_url', this)">📋</button>
             </div>
           </div>
           <div class="field">
             <label>API Key</label>
             <div class="input-with-btn">
               <input id="api_key" dir="ltr" type="password" placeholder="sk-..." autocomplete="off">
-              <button type="button" class="btn-icon" title="عرض/إخفاء" onclick="toggleKeyField(this)">👁</button>
-              <button type="button" class="btn-icon" title="لصق" onclick="pasteInto('api_key')">📥</button>
-              <button type="button" class="btn-icon" title="نسخ" onclick="copyField('api_key', this)">📋</button>
+              <button type="button" class="btn-icon" title="{{t:common.show_hide}}" onclick="toggleKeyField(this)">👁</button>
+              <button type="button" class="btn-icon" title="{{t:common.paste}}" onclick="pasteInto('api_key')">📥</button>
+              <button type="button" class="btn-icon" title="{{t:common.copy}}" onclick="copyField('api_key', this)">📋</button>
             </div>
           </div>
           <div class="field">
-            <label>Provider ID (اختياري)</label>
-            <input id="provider_id" dir="ltr" placeholder="كيتستنتج من الرابط">
+            <label>{{t:test.provider_id}}</label>
+            <input id="provider_id" dir="ltr" placeholder="{{t:test.provider_id_ph}}">
           </div>
-          <button class="primary" id="runBtn" onclick="runOrStop()">▶ شغّل الاختبار</button>
-          <div class="hint">اختصار: <kbd>Ctrl</kbd> + <kbd>Enter</kbd></div>
+          <button class="primary" id="runBtn" onclick="runOrStop()">{{t:test.run}}</button>
+          <div class="hint">{{t:test.shortcut}} <kbd>Ctrl</kbd> + <kbd>Enter</kbd></div>
         </section>
 
         <details class="control-panel" id="advancedSection">
-          <summary><span>⚙️ إعدادات متقدمة</span><span class="summary-note" id="advancedNote"></span></summary>
+          <summary><span>{{t:test.advanced}}</span><span class="summary-note" id="advancedNote"></span></summary>
           <div class="advanced-fields">
             <div class="field wide">
-              <label>موديلات يدوية (اختياري، مفصولة بفاصلة)</label>
+              <label>{{t:test.manual_models}}</label>
               <input id="models" dir="ltr" placeholder="gpt-4o-mini, llama-3-70b">
             </div>
             <div class="field wide">
-              <label>فلتر (regex، اختياري)</label>
+              <label>{{t:test.filter}}</label>
               <input id="filter" dir="ltr" placeholder="gpt|claude">
             </div>
             <div class="field"><label>Timeout (s)</label><input id="timeout" type="number" min="1" value="15"></div>
@@ -1782,27 +1790,27 @@ INDEX_HTML = r"""
             <div class="field"><label>Repeat</label><input id="repeat" type="number" min="1" value="1"></div>
             <div class="checkbox wide">
               <input id="capabilities" type="checkbox">
-              <label for="capabilities" style="margin:0;">كشف القدرات + قياس tokens/s الحقيقي (stream/tools/json)</label>
+              <label for="capabilities" style="margin:0;">{{t:test.capabilities}}</label>
             </div>
           </div>
         </details>
 
         <section class="control-panel">
-          <div class="control-panel-title">💾 الملفات المحفوظة</div>
+          <div class="control-panel-title">{{t:test.saved_profiles}}</div>
           <div class="field">
             <select id="savedProfiles" onchange="applyProfile()">
-              <option value="">— اختار ملف محفوظ —</option>
+              <option value="">{{t:test.pick_profile}}</option>
             </select>
           </div>
           <div class="field">
-            <label>المصدر / الموقع (وين أخدت المفتاح)</label>
-            <input id="source" placeholder="مثلا: موقع X، اشتراك، ...">
+            <label>{{t:test.source}}</label>
+            <input id="source" placeholder="{{t:test.source_ph}}">
           </div>
           <div class="profile-actions">
-            <button class="ghost" onclick="saveProfile()">💾 حفظ الحالي</button>
-            <button class="ghost" onclick="deleteProfile()">🗑 حذف المحدد</button>
-            <button class="ghost" onclick="openFormats()">🧩 الصيغ</button>
-            <button class="ghost" onclick="clearAllFields()">🧹 مسح الحقول</button>
+            <button class="ghost" onclick="saveProfile()">{{t:test.save_current}}</button>
+            <button class="ghost" onclick="deleteProfile()">{{t:test.delete_selected}}</button>
+            <button class="ghost" onclick="openFormats()">{{t:test.formats}}</button>
+            <button class="ghost" onclick="clearAllFields()">{{t:test.clear_fields}}</button>
           </div>
         </section>
       </aside>
@@ -1811,7 +1819,7 @@ INDEX_HTML = r"""
       <main class="results-area">
         <div class="status-line" id="statusLine">
           <span class="spin"></span>
-          <span id="statusText">جاهز. عمر Base URL و API Key وضغط "شغّل الاختبار".</span>
+          <span id="statusText">{{t:test.ready}}</span>
         </div>
 
         <!-- SUMMARY (shows after a run) -->
@@ -1823,7 +1831,7 @@ INDEX_HTML = r"""
           </div>
           <div class="actions">
             <div class="dd" id="copyDD">
-              <button class="dd-btn" onclick="toggleCopyDD(event)">📋 نسخ الإعداد <span class="caret">⌄</span></button>
+              <button class="dd-btn" onclick="toggleCopyDD(event)">{{t:test.copy_config}} <span class="caret">⌄</span></button>
               <div class="dd-menu" id="copyDDMenu"></div>
             </div>
             <button class="ghost" id="dlReport" disabled onclick="downloadReport()">⬇ report.json</button>
@@ -1833,24 +1841,24 @@ INDEX_HTML = r"""
         <!-- TABLE -->
         <div class="card" style="margin-bottom:16px;">
           <div class="card-head">
-            <h3>🧬 نتائج الاختبار</h3>
+            <h3>{{t:test.results}}</h3>
             <div class="spacer"></div>
             <div class="filters">
-              <button class="chip on" data-filter="all" onclick="setResultFilter('all')">الكل<span class="n" id="fcAll">0</span></button>
-              <button class="chip" data-filter="ok" onclick="setResultFilter('ok')">✅ خدام<span class="n" id="fcOk">0</span></button>
-              <button class="chip" data-filter="bad" onclick="setResultFilter('bad')">⛔ فاشل<span class="n" id="fcBad">0</span></button>
-              <input class="search-input" id="resultSearch" dir="ltr" placeholder="🔎 قلب على موديل" oninput="applyResultFilter()">
+              <button class="chip on" data-filter="all" onclick="setResultFilter('all')">{{t:common.all}}<span class="n" id="fcAll">0</span></button>
+              <button class="chip" data-filter="ok" onclick="setResultFilter('ok')">{{t:common.ok_filter}}<span class="n" id="fcOk">0</span></button>
+              <button class="chip" data-filter="bad" onclick="setResultFilter('bad')">{{t:test.f_bad}}<span class="n" id="fcBad">0</span></button>
+              <input class="search-input" id="resultSearch" dir="ltr" placeholder="{{t:test.search_ph}}" oninput="applyResultFilter()">
             </div>
           </div>
           <div style="overflow-x:auto;">
             <table>
               <thead>
                 <tr>
-                  <th>الموديل</th><th>الحالة</th><th>الزمن / التشخيص</th><th title="سرعة التوليد الحقيقية — كتقاس غير ملي تفعل كشف القدرات">tokens/s</th><th>القدرات</th>
+                  <th>{{t:test.th_model}}</th><th>{{t:test.th_status}}</th><th>{{t:test.th_time}}</th><th title="{{t:test.th_tps}}">tokens/s</th><th>{{t:test.th_caps}}</th>
                 </tr>
               </thead>
               <tbody id="tbody">
-                <tr class="empty-row"><td colspan="5">النتائج غادي تبان هنا مباشرة ملي تشغّل الاختبار.</td></tr>
+                <tr class="empty-row"><td colspan="5">{{t:test.empty_rows}}</td></tr>
               </tbody>
             </table>
           </div>
@@ -1859,12 +1867,12 @@ INDEX_HTML = r"""
         <!-- CHART -->
         <div class="card">
           <div class="card-head">
-            <h3>📊 سرعة الموديلات الخدامة (seconds)</h3>
+            <h3>{{t:test.chart_title}}</h3>
             <div class="spacer"></div>
-            <span style="color:var(--muted); font-size:11.5px;">مرتبة من الأسرع — الأقصر = الأسرع</span>
+            <span style="color:var(--muted); font-size:11.5px;">{{t:test.chart_note}}</span>
           </div>
           <div class="chart-wrap">
-            <div class="chart" id="chart"><div class="chart-empty" style="width:100%;">النتائج غادي تظهر هنا بعد التشغيل</div></div>
+            <div class="chart" id="chart"><div class="chart-empty" style="width:100%;">{{t:test.chart_empty}}</div></div>
           </div>
         </div>
       </main>
@@ -1876,45 +1884,45 @@ INDEX_HTML = r"""
   ================================================================= -->
   <div class="tab-panel" id="tab-keys" hidden>
     <div class="stat-strip">
-      <div class="stat accent"><div class="num" id="ksTotal">0</div><div class="label">🔑 مفاتيح محفوظة</div></div>
-      <div class="stat ok"><div class="num" id="ksOk">0</div><div class="label">✅ كلشي خدام</div></div>
-      <div class="stat warn"><div class="num" id="ksWarn">0</div><div class="label">⚠️ تبدلو الموديلات</div></div>
-      <div class="stat bad"><div class="num" id="ksBad">0</div><div class="label">⛔ متوقفين</div></div>
+      <div class="stat accent"><div class="num" id="ksTotal">0</div><div class="label">{{t:keys.stat_saved}}</div></div>
+      <div class="stat ok"><div class="num" id="ksOk">0</div><div class="label">{{t:keys.stat_ok}}</div></div>
+      <div class="stat warn"><div class="num" id="ksWarn">0</div><div class="label">{{t:keys.stat_warn}}</div></div>
+      <div class="stat bad"><div class="num" id="ksBad">0</div><div class="label">{{t:keys.stat_bad}}</div></div>
     </div>
 
     <section class="control-panel monitor-panel">
       <div class="mon-title">
         <span class="pulse paused" id="livePulse"></span>
         <div>
-          <div class="live-label" id="liveLabel">المراقبة الدورية</div>
-          <div class="countdown" id="monitorNextRun">كتفحص كل المفاتيح وحدها وكتنبهك ملي يتبدل شي حاجة</div>
+          <div class="live-label" id="liveLabel">{{t:keys.monitor}}</div>
+          <div class="countdown" id="monitorNextRun">{{t:keys.monitor_desc}}</div>
         </div>
       </div>
       <div class="mon-controls">
-        <span class="mon-lbl">كل</span>
+        <span class="mon-lbl">{{t:keys.every}}</span>
         <div class="seg" id="intervalSeg">
-          <button data-min="1" onclick="setMonitorInterval(1)">1 د</button>
-          <button data-min="5" class="on" onclick="setMonitorInterval(5)">5 د</button>
-          <button data-min="10" onclick="setMonitorInterval(10)">10 د</button>
-          <button data-min="30" onclick="setMonitorInterval(30)">30 د</button>
+          <button data-min="1" onclick="setMonitorInterval(1)">1 {{t:unit.min}}</button>
+          <button data-min="5" class="on" onclick="setMonitorInterval(5)">5 {{t:unit.min}}</button>
+          <button data-min="10" onclick="setMonitorInterval(10)">10 {{t:unit.min}}</button>
+          <button data-min="30" onclick="setMonitorInterval(30)">30 {{t:unit.min}}</button>
         </div>
-        <button class="ghost" id="liveToggleBtn" onclick="toggleMonitor()">▶ تشغيل المراقبة</button>
-        <button class="ghost" id="checkAllBtn" onclick="checkAllProfiles()">🔄 فحص الكل الآن</button>
+        <button class="ghost" id="liveToggleBtn" onclick="toggleMonitor()">{{t:keys.monitor_start}}</button>
+        <button class="ghost" id="checkAllBtn" onclick="checkAllProfiles()">{{t:keys.check_all}}</button>
       </div>
     </section>
 
     <div class="keys-toolbar">
       <div class="filters">
-        <button class="chip on" data-kf="all" onclick="setKeyFilter('all')">الكل<span class="n" id="kfAll">0</span></button>
-        <button class="chip" data-kf="ok" onclick="setKeyFilter('ok')">✅ خدام<span class="n" id="kfOk">0</span></button>
-        <button class="chip" data-kf="warn" onclick="setKeyFilter('warn')">⚠️ تبدل<span class="n" id="kfWarn">0</span></button>
-        <button class="chip" data-kf="bad" onclick="setKeyFilter('bad')">⛔ متوقف<span class="n" id="kfBad">0</span></button>
-        <button class="chip" data-kf="idle" onclick="setKeyFilter('idle')">⏳ ما تفحصش<span class="n" id="kfIdle">0</span></button>
-        <input class="search-input" id="keySearch" placeholder="🔎 قلب بالاسم، الرابط ولا الموديل" oninput="renderArchive()">
+        <button class="chip on" data-kf="all" onclick="setKeyFilter('all')">{{t:common.all}}<span class="n" id="kfAll">0</span></button>
+        <button class="chip" data-kf="ok" onclick="setKeyFilter('ok')">{{t:common.ok_filter}}<span class="n" id="kfOk">0</span></button>
+        <button class="chip" data-kf="warn" onclick="setKeyFilter('warn')">{{t:keys.f_warn}}<span class="n" id="kfWarn">0</span></button>
+        <button class="chip" data-kf="bad" onclick="setKeyFilter('bad')">{{t:keys.f_bad}}<span class="n" id="kfBad">0</span></button>
+        <button class="chip" data-kf="idle" onclick="setKeyFilter('idle')">{{t:keys.f_idle}}<span class="n" id="kfIdle">0</span></button>
+        <input class="search-input" id="keySearch" placeholder="{{t:keys.search_ph}}" oninput="renderArchive()">
       </div>
       <div class="toolbar-actions">
-        <button class="ghost" onclick="openFormats()">🧩 الصيغ المخصصة</button>
-        <button class="primary" onclick="goAddKey()">➕ زيد مفتاح</button>
+        <button class="ghost" onclick="openFormats()">{{t:keys.custom_formats}}</button>
+        <button class="primary" onclick="goAddKey()">{{t:keys.add_key}}</button>
       </div>
     </div>
     <div id="archiveBody"></div>
@@ -1927,23 +1935,23 @@ INDEX_HTML = r"""
     <div class="test-layout">
       <aside class="setup-col">
         <section class="control-panel connection-panel">
-          <div class="control-panel-title"><span id="provFormTitle">➕ مزود جديد</span>
-            <button class="ghost sm" id="provFormCancel" style="width:auto; display:none;" onclick="resetProviderForm()">إلغاء</button></div>
+          <div class="control-panel-title"><span id="provFormTitle">{{t:prov.new}}</span>
+            <button class="ghost sm" id="provFormCancel" style="width:auto; display:none;" onclick="resetProviderForm()">{{t:common.cancel}}</button></div>
           <input type="hidden" id="prov_id">
-          <div class="field"><label>الاسم (كيتستعمل فـ provider/model)</label><input id="prov_name" dir="ltr" placeholder="openrouter"></div>
+          <div class="field"><label>{{t:prov.name_label}}</label><input id="prov_name" dir="ltr" placeholder="openrouter"></div>
           <div class="field"><label>Base URL</label><input id="prov_base" dir="ltr" placeholder="https://api.example.com/v1"></div>
-          <div class="field"><label>الصيغة ديال المزود</label>
+          <div class="field"><label>{{t:prov.format_label}}</label>
             <select id="prov_format">
               <option value="openai">OpenAI-compatible (/chat/completions)</option>
               <option value="anthropic">Anthropic (/v1/messages)</option>
             </select></div>
-          <div class="field"><label>موديلات يدوية (اختياري، مفصولة بفاصلة)</label><input id="prov_models" dir="ltr" placeholder="كيتجابو تلقائياً ملي تختبر المفاتيح"></div>
-          <button class="primary" onclick="saveProviderForm()">💾 حفظ المزود</button>
+          <div class="field"><label>{{t:test.manual_models}}</label><input id="prov_models" dir="ltr" placeholder="{{t:prov.models_ph}}"></div>
+          <button class="primary" onclick="saveProviderForm()">{{t:prov.save}}</button>
         </section>
         <section class="control-panel">
-          <div class="control-panel-title">📥 استيراد</div>
-          <p class="modal-desc" style="margin:0 0 10px;">زيد المفاتيح لي محفوظين فـ "مفاتيحي" كمزودين (مفتاح لكل ملف، مجموعين حسب الرابط).</p>
-          <button class="ghost" onclick="importProfilesToGateway()">📥 استيراد الملفات المحفوظة</button>
+          <div class="control-panel-title">{{t:prov.import}}</div>
+          <p class="modal-desc" style="margin:0 0 10px;">{{t:prov.import_desc}}</p>
+          <button class="ghost" onclick="importProfilesToGateway()">{{t:prov.import_btn}}</button>
         </section>
       </aside>
       <main class="results-area" id="providersList"></main>
@@ -1956,38 +1964,38 @@ INDEX_HTML = r"""
   <div class="tab-panel" id="tab-gateway" hidden>
     <div class="gw-grid">
       <section class="control-panel connection-panel">
-        <div class="control-panel-title"><span>🔐 المفتاح المحلي</span>
-          <button class="ghost sm" style="width:auto;" onclick="regenerateLocalKey()">♻️ مفتاح جديد</button></div>
-        <div class="kv-row"><span class="k">Local key</span><code class="v" id="gwLocalKey" dir="ltr">…</code>
-          <button class="mini-copy" title="عرض/إخفاء" onclick="toggleLocalKey()">👁</button>
-          <button class="mini-copy" title="نسخ" onclick="copyRaw(gwState && gwState.local_key, this)">📋</button></div>
+        <div class="control-panel-title"><span>{{t:gw.local_key_title}}</span>
+          <button class="ghost sm" style="width:auto;" onclick="regenerateLocalKey()">{{t:gw.new_key}}</button></div>
+        <div class="kv-row"><span class="k">{{t:gw.local_key}}</span><code class="v" id="gwLocalKey" dir="ltr">…</code>
+          <button class="mini-copy" title="{{t:common.show_hide}}" onclick="toggleLocalKey()">👁</button>
+          <button class="mini-copy" title="{{t:common.copy}}" onclick="copyRaw(gwState && gwState.local_key, this)">📋</button></div>
         <div class="kv-row"><span class="k">OpenAI base</span><code class="v" id="gwOpenAI" dir="ltr">…</code>
-          <button class="mini-copy" title="نسخ" onclick="copyRaw(gwState && gwState.openai_base, this)">📋</button></div>
+          <button class="mini-copy" title="{{t:common.copy}}" onclick="copyRaw(gwState && gwState.openai_base, this)">📋</button></div>
         <div class="kv-row"><span class="k">Anthropic base</span><code class="v" id="gwAnthropic" dir="ltr">…</code>
-          <button class="mini-copy" title="نسخ" onclick="copyRaw(gwState && gwState.anthropic_base, this)">📋</button></div>
-        <p class="modal-desc" style="margin:10px 0 0;">الوكلاء كيستعملو هاد المفتاح. الـ gateway كيختار مفتاح حقيقي خدام، وإلا فشل ولا وصل للحد كيدوز للي موراه بوحدو. المفاتيح الحقيقية ما كيخرجوش من السيرفر.</p>
+          <button class="mini-copy" title="{{t:common.copy}}" onclick="copyRaw(gwState && gwState.anthropic_base, this)">📋</button></div>
+        <p class="modal-desc" style="margin:10px 0 0;">{{t:gw.desc}}</p>
       </section>
       <section class="control-panel">
-        <div class="control-panel-title"><span>🧠 الموديلات المتاحة فالـ gateway</span><span id="gwModelCount" class="summary-note"></span></div>
+        <div class="control-panel-title"><span>{{t:gw.models_title}}</span><span id="gwModelCount" class="summary-note"></span></div>
         <div class="model-tags" id="gwModels"></div>
-        <p class="modal-desc" style="margin:10px 0 0;">استعمل اسم الموديل مباشرة، ولا <code dir="ltr">provider/model</code> باش تفرض مزود معين.</p>
+        <p class="modal-desc" style="margin:10px 0 0;">{{h:gw.models_hint}}</p>
       </section>
     </div>
     <div class="card">
       <div class="card-head">
-        <h3>📜 السجل</h3>
+        <h3>{{t:gw.log}}</h3>
         <div class="spacer"></div>
         <div class="filters">
-          <button class="chip on" data-lf="all" onclick="setLogFilter('all')">الكل</button>
-          <button class="chip" data-lf="ok" onclick="setLogFilter('ok')">✅ نجح</button>
-          <button class="chip" data-lf="error" onclick="setLogFilter('error')">⛔ خطأ</button>
-          <button class="ghost sm" style="width:auto;" onclick="clearGatewayLogs()">🗑 مسح</button>
+          <button class="chip on" data-lf="all" onclick="setLogFilter('all')">{{t:common.all}}</button>
+          <button class="chip" data-lf="ok" onclick="setLogFilter('ok')">{{t:gw.f_ok}}</button>
+          <button class="chip" data-lf="error" onclick="setLogFilter('error')">{{t:gw.f_err}}</button>
+          <button class="ghost sm" style="width:auto;" onclick="clearGatewayLogs()">{{t:gw.clear}}</button>
         </div>
       </div>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>الوقت</th><th>العميل</th><th>الموديل</th><th>المزود / المفتاح</th><th>الحالة</th><th>tokens</th><th>المدة</th></tr></thead>
-          <tbody id="logsBody"><tr class="empty-row"><td colspan="7">ما كاين حتى طلب بعد.</td></tr></tbody>
+          <thead><tr><th>{{t:gw.th_time}}</th><th>{{t:gw.th_client}}</th><th>{{t:test.th_model}}</th><th>{{t:gw.th_provkey}}</th><th>{{t:test.th_status}}</th><th>tokens</th><th>{{t:gw.th_duration}}</th></tr></thead>
+          <tbody id="logsBody"><tr class="empty-row"><td colspan="7">{{t:gw.no_requests}}</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -2013,24 +2021,24 @@ INDEX_HTML = r"""
   ================================================================= -->
   <div class="tab-panel" id="tab-agents" hidden>
     <div class="agents-head">
-      <p class="modal-desc">"تفعيل" كياخد نسخة احتياطية من الإعدادات ديال الوكيل، ومن بعد كيكتب فيها رابط الـ gateway والمفتاح المحلي. "إيقاف" كيرجع الإعدادات الأصلية. عاود شغّل الوكيل من بعد أي تغيير. ضغط على الصورة باش تبدلها.</p>
-      <button class="primary" onclick="openAgentForm()">➕ زيد وكيل</button>
+      <p class="modal-desc">{{t:agents.desc}}</p>
+      <button class="primary" onclick="openAgentForm()">{{t:agents.add}}</button>
     </div>
     <div class="agent-grid" id="agentsList"></div>
     <section class="control-panel desktop-guide">
-      <div class="control-panel-title"><span>🖥️ Claude Desktop (التطبيق)</span><span class="summary-note">كيتربط من داخل التطبيق، ماشي بزر</span></div>
+      <div class="control-panel-title"><span>{{t:agents.desktop_title}}</span><span class="summary-note">{{t:agents.desktop_note}}</span></div>
       <ol class="modal-desc" style="margin:0 0 10px; padding-inline-start:18px; line-height:1.9;">
-        <li>فالتطبيق: <b>Help → Troubleshooting → Enable Developer Mode</b></li>
-        <li>من بعد: <b>Developer → Configure Third-Party Inference…</b> واختار <b>Gateway</b></li>
-        <li>عمر القيم لي تحت، ضغط <b>Apply Changes</b> ومن بعد <b>Save &amp; Restart</b></li>
-        <li>فشاشة الدخول اختار البداية بالإعدادات ديال الـ gateway (ماشي الحساب). باش ترجع للحساب، اختار الدخول بـ Anthropic.</li>
+        <li>{{h:agents.dg1}}</li>
+        <li>{{h:agents.dg2}}</li>
+        <li>{{h:agents.dg3}}</li>
+        <li>{{t:agents.dg4}}</li>
       </ol>
       <div class="kv-row"><span class="k">Gateway base URL</span><code class="v" id="dgBase" dir="ltr">…</code>
-        <button class="mini-copy" title="نسخ" onclick="copyRaw(gwState && gwState.anthropic_base, this)">📋</button></div>
+        <button class="mini-copy" title="{{t:common.copy}}" onclick="copyRaw(gwState && gwState.anthropic_base, this)">📋</button></div>
       <div class="kv-row"><span class="k">Gateway API key</span><code class="v" id="dgKey" dir="ltr">…</code>
-        <button class="mini-copy" title="نسخ" onclick="copyRaw(gwState && gwState.local_key, this)">📋</button></div>
+        <button class="mini-copy" title="{{t:common.copy}}" onclick="copyRaw(gwState && gwState.local_key, this)">📋</button></div>
       <div class="kv-row"><span class="k">Auth scheme</span><code class="v" dir="ltr">bearer</code></div>
-      <p class="modal-desc" style="margin:8px 0 0;">فهاد الوضع التطبيق كيخدم بلا الحساب ديالك: المحادثات كيتحفظو غير فالجهاز، وخاص هاد البرنامج يبقى شاعل.</p>
+      <p class="modal-desc" style="margin:8px 0 0;">{{t:agents.dg_note}}</p>
     </section>
   </div>
 </div>
@@ -2040,38 +2048,38 @@ INDEX_HTML = r"""
 <div class="modal-overlay" id="agentOverlay" onclick="if(event.target===this) closeAgentForm()">
   <div class="modal" style="width: min(620px, 100%);">
     <div class="modal-header">
-      <h2 id="agentFormTitle">🤖 زيد وكيل</h2>
-      <button class="modal-close" onclick="closeAgentForm()">إغلاق ✕</button>
+      <h2 id="agentFormTitle">{{t:agents.form_add}}</h2>
+      <button class="modal-close" onclick="closeAgentForm()">{{t:common.close}}</button>
     </div>
-    <p class="modal-desc">أي أداة كتقرا الرابط والمفتاح من ملف JSON ولا من ملف .env. قول ليا فين كاين الملف وشمن حقول فيه، و"تفعيل" غادي يبدل غير هادوك الحقول (مع نسخة احتياطية).</p>
+    <p class="modal-desc">{{t:agents.form_desc}}</p>
     <input type="hidden" id="ag_id">
     <div class="row2">
-      <div class="field"><label>الاسم</label><input id="ag_name" placeholder="مثلا: Crush"></div>
-      <div class="field"><label>نوع الملف</label>
+      <div class="field"><label>{{t:agents.name}}</label><input id="ag_name" placeholder="{{t:agents.name_ph}}"></div>
+      <div class="field"><label>{{t:agents.kind}}</label>
         <select id="ag_kind" onchange="updateAgentFormHints()">
-          <option value="json">JSON (حقول بحال a.b.c)</option>
+          <option value="json">{{t:agents.kind_json}}</option>
           <option value="env">.env (KEY=VALUE)</option>
         </select></div>
     </div>
-    <div class="field"><label>المسار ديال الملف</label><input id="ag_path" dir="ltr" placeholder="~/.config/tool/config.json"></div>
-    <div class="field"><label>الصيغة لي كيهضر بيها الوكيل</label>
+    <div class="field"><label>{{t:agents.path}}</label><input id="ag_path" dir="ltr" placeholder="~/.config/tool/config.json"></div>
+    <div class="field"><label>{{t:agents.format}}</label>
       <select id="ag_format" onchange="updateAgentFormHints()">
-        <option value="openai">OpenAI — الرابط كيتكتب بـ /v1</option>
-        <option value="anthropic">Anthropic — الرابط بلا /v1</option>
+        <option value="openai">{{t:agents.fmt_openai}}</option>
+        <option value="anthropic">{{t:agents.fmt_anthropic}}</option>
       </select></div>
-    <div class="field"><label>حقل الرابط (Base URL)</label><input id="ag_f_base" dir="ltr"></div>
-    <div class="field"><label>حقل المفتاح (API key)</label><input id="ag_f_key" dir="ltr"></div>
-    <div class="field"><label>حقل الموديل (اختياري)</label><input id="ag_f_model" dir="ltr"></div>
+    <div class="field"><label>{{t:agents.f_base}}</label><input id="ag_f_base" dir="ltr"></div>
+    <div class="field"><label>{{t:agents.f_key}}</label><input id="ag_f_key" dir="ltr"></div>
+    <div class="field"><label>{{t:agents.f_model}}</label><input id="ag_f_model" dir="ltr"></div>
     <div class="agent-preview" id="agentPreview" dir="ltr"></div>
-    <button class="primary" onclick="saveAgentForm()">💾 حفظ الوكيل</button>
+    <button class="primary" onclick="saveAgentForm()">{{t:agents.save}}</button>
   </div>
 </div>
 
 <!-- icon picker -->
 <div class="icon-menu" id="iconMenu">
-  <button onclick="pickIconFile()">🖼 صورة من الجهاز</button>
-  <button onclick="pickIconEmoji()">😀 إيموجي</button>
-  <button id="iconResetBtn" onclick="resetIcon()">↩️ رجع الأصلية</button>
+  <button onclick="pickIconFile()">{{t:icon.file}}</button>
+  <button onclick="pickIconEmoji()">{{t:icon.emoji}}</button>
+  <button id="iconResetBtn" onclick="resetIcon()">{{t:icon.reset}}</button>
 </div>
 <input type="file" id="iconFile" accept="image/*" style="display:none" onchange="iconFileChosen(this)">
 
@@ -2079,25 +2087,22 @@ INDEX_HTML = r"""
 <div class="modal-overlay" id="formatsOverlay" onclick="if(event.target===this) closeFormats()">
   <div class="modal">
     <div class="modal-header">
-      <h2>🧩 الصيغ المخصصة (piagent, hermes, ...)</h2>
-      <button class="modal-close" onclick="closeFormats()">إغلاق ✕</button>
+      <h2>{{t:formats.title}}</h2>
+      <button class="modal-close" onclick="closeFormats()">{{t:common.close}}</button>
     </div>
-    <p class="modal-desc">
-      دخل اسم الصيغة، ولصق مثال حقيقي (JSON) ديالها فيه baseURL وموديلات — والسكريبت غادي يبدل
-      تلقائياً baseURL وapiKey وقائمة الموديلات بمعلومات كل ملف محفوظ عند النسخ.
-    </p>
+    <p class="modal-desc">{{t:formats.desc}}</p>
     <div class="field">
-      <label>اسم الصيغة</label>
+      <label>{{t:formats.name}}</label>
       <input id="formatName" placeholder="hermes">
     </div>
     <div class="field">
-      <label>مثال JSON</label>
+      <label>{{t:formats.example}}</label>
       <textarea id="formatTemplate" rows="10" dir="ltr"
         style="width:100%; background: var(--surface-2); border:1px solid var(--line); color: var(--text);
                padding:9px 10px; border-radius:6px; font:inherit; resize:vertical;"
         placeholder='{"providers": {"agentrouter": {"options": {"baseURL": "...", "apiKey": "..."}, "models": {...}}}}'></textarea>
     </div>
-    <button class="primary" onclick="saveFormat()">💾 حفظ الصيغة</button>
+    <button class="primary" onclick="saveFormat()">{{t:formats.save}}</button>
     <div id="formatsListBody" style="margin-top:20px;"></div>
   </div>
 </div>
@@ -2116,37 +2121,48 @@ INDEX_HTML = r"""
 <div class="modal-overlay" id="settingsOverlay" onclick="if(event.target===this) closeSettings()">
   <div class="modal" style="width: min(520px, 100%);">
     <div class="modal-header">
-      <h2>⚙️ الإعدادات</h2>
-      <button class="modal-close" onclick="closeSettings()">إغلاق ✕</button>
+      <h2>{{t:settings.title}}</h2>
+      <button class="modal-close" onclick="closeSettings()">{{t:common.close}}</button>
     </div>
     <div class="setting-row">
       <div>
-        <div class="s-label">المظهر</div>
-        <div class="s-sub">وضع داكن أو فاتح للواجهة</div>
+        <div class="s-label">{{t:settings.lang}}</div>
+        <div class="s-sub">{{t:settings.lang_sub}}</div>
+      </div>
+      <div class="seg" id="langSeg">
+        <button data-lang="ar" onclick="setLang('ar')">{{t:lang.ar}}</button>
+        <button data-lang="en" onclick="setLang('en')">{{t:lang.en}}</button>
+        <button data-lang="fr" onclick="setLang('fr')">{{t:lang.fr}}</button>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="s-label">{{t:settings.theme}}</div>
+        <div class="s-sub">{{t:settings.theme_sub}}</div>
       </div>
       <div class="theme-seg" id="themeSeg">
-        <button data-theme="dark" onclick="setTheme('dark')">🌙 داكن</button>
-        <button data-theme="light" onclick="setTheme('light')">☀️ فاتح</button>
+        <button data-theme="dark" onclick="setTheme('dark')">{{t:settings.dark}}</button>
+        <button data-theme="light" onclick="setTheme('light')">{{t:settings.light}}</button>
       </div>
     </div>
     <div class="setting-row">
       <div>
-        <div class="s-label">الإشعارات (Toasts)</div>
-        <div class="s-sub">تنبيهات عند تغيير موديل أو توقف مفتاح</div>
+        <div class="s-label">{{t:settings.toasts}}</div>
+        <div class="s-sub">{{t:settings.toasts_sub}}</div>
       </div>
       <div class="toggle" id="toastToggle" onclick="toggleToasts()"></div>
     </div>
     <div class="setting-row">
       <div>
-        <div class="s-label">المراقبة التلقائية</div>
-        <div class="s-sub">فحص دوري لكل المفاتيح المربوطة</div>
+        <div class="s-label">{{t:settings.monitor}}</div>
+        <div class="s-sub">{{t:settings.monitor_sub}}</div>
       </div>
       <div class="toggle" id="monitorToggle" onclick="toggleMonitor()"></div>
     </div>
     <div class="setting-row">
       <div>
-        <div class="s-label">فاصل المراقبة</div>
-        <div class="s-sub">كل كام دقيقة يتعمل الفحص</div>
+        <div class="s-label">{{t:settings.interval}}</div>
+        <div class="s-sub">{{t:settings.interval_sub}}</div>
       </div>
       <div class="seg" id="settingsIntervalSeg">
         <button data-min="1" onclick="setMonitorInterval(1)">1</button>
@@ -2190,6 +2206,31 @@ INDEX_HTML = r"""
 <div id="toasts"></div>
 
 <script>
+/* =========================================================================
+   LANGUAGE — the server fills in the dictionary of the saved language (i18n/<lang>.json)
+   ========================================================================= */
+const I18N = {{i18n:json}};
+const LANG = '{{i18n:lang}}';
+const RTL = document.documentElement.dir === 'rtl';
+// T('key', {name: value}) -> text with {name} filled in. Escape user data before it goes into HTML.
+function T(key, params) {
+  const s = I18N[key] ?? key;
+  return params ? s.replace(/\{(\w+)\}/g, (m, k) => k in params ? params[k] : m) : s;
+}
+async function setLang(lang) {
+  if (lang === LANG) return;
+  if (currentRun && !confirm(T('settings.lang_confirm_stop'))) { syncLangUI(); return; }
+  try {
+    await api('/api/settings', { lang });
+    await Promise.all(Object.keys(STORE_KEYS).map(flushStore));   // unsaved key changes first
+    location.reload();
+  } catch (e) { toast(T('settings.lang_failed'), 'bad', e.message); syncLangUI(); }
+}
+function syncLangUI() {
+  const sel = document.getElementById('langSelect'); if (sel) sel.value = LANG;
+  document.querySelectorAll('#langSeg button').forEach(b => b.classList.toggle('on', b.dataset.lang === LANG));
+}
+
 /* =========================================================================
    STORAGE KEYS + STATE  (same keys as before → backward compatible)
    ========================================================================= */
@@ -2284,7 +2325,7 @@ function toggleToasts() {
   p.toasts = !(p.toasts !== false);
   setPrefs(p);
   applyToastUI();
-  toast(p.toasts ? 'تم تشغيل الإشعارات' : 'تم إيقاف الإشعارات', p.toasts ? 'ok' : 'warn');
+  toast(p.toasts ? T('toast.notif_on') : T('toast.notif_off'), p.toasts ? 'ok' : 'warn');
 }
 
 /* =========================================================================
@@ -2302,7 +2343,7 @@ function toast(title, type='ok', body='') {
   wrap.appendChild(el);
   setTimeout(() => {
     el.style.transition = 'opacity .3s, transform .3s';
-    el.style.opacity = '0'; el.style.transform = 'translateX(-16px)';
+    el.style.opacity = '0'; el.style.transform = RTL ? 'translateX(-16px)' : 'translateX(16px)';
     setTimeout(() => el.remove(), 320);
   }, 5200);
   // flash header bell
@@ -2354,7 +2395,7 @@ function flushStore(name) {
       outbox[name].splice(0, ops.length);
       if (!outbox[name].length) adoptStore(name, value);   // newer local changes still on the way: wait for them
     } catch (e) {
-      toast('ما تحفظش على الجهاز', 'bad', e.message);
+      toast(T('store.save_failed'), 'bad', e.message);
       setTimeout(() => flushStore(name), 5000);
     }
   });
@@ -2395,7 +2436,7 @@ function setProfiles(list, saved) { saveStore('profiles', list, saved); }
 function refreshProfileSelect(selectName) {
   const sel = document.getElementById('savedProfiles');
   const profiles = getProfiles();
-  sel.innerHTML = '<option value="">— اختار ملف محفوظ —</option>' +
+  sel.innerHTML = `<option value="">${escapeHtml(T('test.pick_profile'))}</option>` +
     profiles.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
   if (selectName) sel.value = selectName;
 }
@@ -2417,14 +2458,14 @@ function currentFormValues() {
 }
 
 function saveProfile() {
-  if (testerKeyRef) { toast('هاد المفتاح محفوظ فالمزود، ما كيتحفظش كملف.', 'warn'); return; }
+  if (testerKeyRef) { toast(T('profile.provider_key'), 'warn'); return; }
   const values = currentFormValues();
   if (!values.base_url || !values.api_key) {
-    toast('عمر Base URL و API Key قبل ما تحفظ.', 'bad'); return;
+    toast(T('profile.fill_first'), 'bad'); return;
   }
   const suggested = values.provider_id || (values.base_url.replace(/^https?:\/\//, '').split('/')[0]);
   const existing = getProfiles().find(p => p.name === suggested);
-  const name = prompt('سمي هاد الملف المحفوظ:', suggested) || suggested;
+  const name = prompt(T('profile.name_prompt'), suggested) || suggested;
   if (!name) return;
 
   const profiles = getProfiles();
@@ -2434,7 +2475,7 @@ function saveProfile() {
   setProfiles(profiles, name);
   refreshProfileSelect(name);
   updateKeyStats();
-  toast(`تم حفظ "${name}"`, 'ok');
+  toast(T('common.saved_name', { name }), 'ok');
 }
 
 function applyProfile() {
@@ -2455,17 +2496,17 @@ function applyProfile() {
   document.getElementById('capabilities').checked = !!profile.capabilities;
   document.getElementById('source').value = profile.source || '';
   updateAdvancedNote();
-  toast(`تم تحميل "${name}"`, 'ok');
+  toast(T('profile.loaded', { name }), 'ok');
 }
 
 function deleteProfile() {
   const name = document.getElementById('savedProfiles').value;
-  if (!name) { toast('اختار الملف لي بغيتي نحذفو.', 'warn'); return; }
-  if (!confirm(`متأكد بغيتي تحذف "${name}"؟`)) return;
+  if (!name) { toast(T('profile.pick_delete'), 'warn'); return; }
+  if (!confirm(T('common.confirm_delete', { name }))) return;
   setProfiles(getProfiles().filter(p => p.name !== name));
   refreshProfileSelect();
   updateKeyStats();
-  toast(`تم حذف "${name}"`, 'warn');
+  toast(T('common.deleted_name', { name }), 'warn');
 }
 
 /* =========================================================================
@@ -2489,10 +2530,10 @@ function flashCopied(btn) {
 }
 function copyField(fieldId, btn) {
   const el = document.getElementById(fieldId);
-  if (!el || !el.value) { toast('الخانة فارغة.', 'warn'); return; }
+  if (!el || !el.value) { toast(T('copy.empty_field'), 'warn'); return; }
   copyToClipboard(el.value.trim()).then(ok => {
     if (ok) { flashCopied(btn); }
-    else toast('ما قدرتش ننسخ (رفض المتصفح).', 'bad');
+    else toast(T('copy.failed'), 'bad');
   });
 }
 async function pasteInto(fieldId) {
@@ -2501,11 +2542,11 @@ async function pasteInto(fieldId) {
   if (fieldId === 'api_key' || fieldId === 'base_url') clearTesterKeyRef();
   try {
     const text = await navigator.clipboard.readText();
-    if (!text) { toast('الحافظة فارغة.', 'warn'); return; }
+    if (!text) { toast(T('paste.empty'), 'warn'); return; }
     input.value = text.trim();
     input.dispatchEvent(new Event('input'));
   } catch (e) {
-    toast('ما قدرتش نلصق تلقائياً — دير Ctrl+V يدوياً.', 'warn');
+    toast(T('paste.failed'), 'warn');
     input.focus();
   }
 }
@@ -2520,9 +2561,9 @@ function updateAdvancedNote() {
   const note = document.getElementById('advancedNote');
   if (!note) return;
   const bits = [];
-  if (document.getElementById('models').value.trim()) bits.push('موديلات يدوية');
-  if (document.getElementById('filter').value.trim()) bits.push('فلتر');
-  if (document.getElementById('capabilities').checked) bits.push('القدرات');
+  if (document.getElementById('models').value.trim()) bits.push(T('adv.manual'));
+  if (document.getElementById('filter').value.trim()) bits.push(T('adv.filter'));
+  if (document.getElementById('capabilities').checked) bits.push(T('adv.caps'));
   note.textContent = bits.join(' · ');
 }
 
@@ -2538,7 +2579,7 @@ function clearAllFields() {
   document.getElementById('capabilities').checked = false;
   document.getElementById('savedProfiles').value = '';
   updateAdvancedNote();
-  setStatus('تم مسح كل الحقول.');
+  setStatus(T('test.cleared'));
 }
 
 /* =========================================================================
@@ -2559,25 +2600,25 @@ function maskKey(key) {
   return key.slice(0,4) + '•'.repeat(Math.max(4, key.length - 8)) + key.slice(-4);
 }
 function timeAgo(ts) {
-  if (!ts) return 'لم يُفحص بعد';
+  if (!ts) return T('time.never');
   const diff = Math.round((Date.now() - ts) / 1000);
-  if (diff < 5) return 'الآن بالضبط';
-  if (diff < 60) return `منذ ${diff} ثانية`;
-  if (diff < 3600) return `منذ ${Math.round(diff/60)} دقيقة`;
-  if (diff < 86400) return `منذ ${Math.round(diff/3600)} ساعة`;
-  return `منذ ${Math.round(diff/86400)} يوم`;
+  if (diff < 5) return T('time.now');
+  if (diff < 60) return T('time.secs', { n: diff });
+  if (diff < 3600) return T('time.mins', { n: Math.round(diff/60) });
+  if (diff < 86400) return T('time.hours', { n: Math.round(diff/3600) });
+  return T('time.days', { n: Math.round(diff/86400) });
 }
 function normalizeWorkingEntry(w) { return (typeof w === 'string') ? { model: w, time: null } : w; }
 
 function statusBadge(p) {
-  if (p.checking) return '<span class="pill pending">⏳ كيتفحص...</span>';
-  if (!p.lastCheck) return '<span class="pill pending">لم يُفحص بعد</span>';
-  if (!p.lastCheck.keyValid) return '<span class="pill bad">❌ المفتاح متوقف</span>';
+  if (p.checking) return `<span class="pill pending">${T('badge.checking')}</span>`;
+  if (!p.lastCheck) return `<span class="pill pending">${T('time.never')}</span>`;
+  if (!p.lastCheck.keyValid) return `<span class="pill bad">${T('badge.key_down')}</span>`;
   if (!p.lastCheck.working || p.lastCheck.working.length === 0)
-    return '<span class="pill bad">⛔ حتى موديل خدام</span>';
+    return `<span class="pill bad">${T('badge.none_working')}</span>`;
   const changed = (p.lastCheck.added.length || p.lastCheck.removed.length) && p.lastCheck.hadPrevious;
-  if (changed) return '<span class="pill pending">⚠️ تغيّرت الموديلات</span>';
-  return '<span class="pill ok">✅ كل شيء خدام</span>';
+  if (changed) return `<span class="pill pending">${T('badge.changed')}</span>`;
+  return `<span class="pill ok">${T('badge.all_ok')}</span>`;
 }
 
 // Long lists (a key can have thousands of models): a card shows the fastest few,
@@ -2593,13 +2634,13 @@ function modelTags(list, key) {
   if (key == null || sorted.length <= MODELS_PREVIEW) return `<div class="model-tags">${sorted.map(tag).join('')}</div>`;
   if (!modelsOpen.has(key)) {
     return `<div class="model-tags">${sorted.slice(0, MODELS_PREVIEW).map(tag).join('')}</div>
-      <button class="models-more" onclick="toggleModels('${esc(key)}')">عرض الكل (${sorted.length}) ▾</button>`;
+      <button class="models-more" onclick="toggleModels('${esc(key)}')">${T('models.show_all', { n: sorted.length })}</button>`;
   }
-  return `<input class="models-search" dir="ltr" data-key="${escapeHtml(key)}" placeholder="🔎 ${sorted.length} models..."
+  return `<input class="models-search" dir="ltr" data-key="${escapeHtml(key)}" placeholder="${escapeHtml(T('models.search_ph', { n: sorted.length }))}"
       value="${escapeHtml(modelsQuery[key] || '')}" oninput="filterModels(this)">
     <div class="model-tags models-scroll">${sorted.map(tag).join('')}</div>
-    <div class="models-none" hidden>ما كاين حتى موديل بهاد الاسم</div>
-    <button class="models-more" onclick="toggleModels('${esc(key)}')">صغّر ▴</button>`;
+    <div class="models-none" hidden>${T('models.none')}</div>
+    <button class="models-more" onclick="toggleModels('${esc(key)}')">${T('models.collapse')}</button>`;
 }
 function toggleModels(key) {
   if (modelsOpen.has(key)) modelsOpen.delete(key); else modelsOpen.add(key);
@@ -2620,8 +2661,8 @@ function shortList(arr, max = 8) {
 function diffLine(p) {
   if (!p.lastCheck || !p.lastCheck.hadPrevious) return '';
   const parts = [];
-  if (p.lastCheck.added.length) parts.push(`<span class="diff-add" title="${escapeHtml(p.lastCheck.added.join(', '))}">+ زائد: ${shortList(p.lastCheck.added)}</span>`);
-  if (p.lastCheck.removed.length) parts.push(`<span class="diff-remove" title="${escapeHtml(p.lastCheck.removed.join(', '))}">− توقف: ${shortList(p.lastCheck.removed)}</span>`);
+  if (p.lastCheck.added.length) parts.push(`<span class="diff-add" title="${escapeHtml(p.lastCheck.added.join(', '))}">${T('diff.added', { list: shortList(p.lastCheck.added) })}</span>`);
+  if (p.lastCheck.removed.length) parts.push(`<span class="diff-remove" title="${escapeHtml(p.lastCheck.removed.join(', '))}">${T('diff.removed', { list: shortList(p.lastCheck.removed) })}</span>`);
   if (!parts.length) return '';
   return `<div class="diff-line">${parts.join(' &middot; ')}</div>`;
 }
@@ -2645,7 +2686,7 @@ function setKeyFilter(f) {
 function goAddKey() {
   showTab('test');
   clearTesterKeyRef();
-  setStatus('عمر Base URL و API Key، جرب، ومن بعد ضغط "💾 حفظ الحالي" باش يتزاد لـ "مفاتيحي".');
+  setStatus(T('keys.go_add'));
   document.getElementById('base_url').focus();
 }
 async function sendProfileToGateway(name) {
@@ -2654,8 +2695,8 @@ async function sendProfileToGateway(name) {
   try {
     const r = await api('/api/providers/import', { profiles: [profile] });
     gwState = r;
-    toast(r.imported ? `"${name}" تزاد للمزودين فالـ gateway` : `"${name}" ديجا كاين فالـ gateway`, r.imported ? 'ok' : 'warn');
-  } catch (e) { toast('ما تزادش', 'bad', e.message); }
+    toast(r.imported ? T('keys.sent_gw', { name }) : T('keys.already_gw', { name }), r.imported ? 'ok' : 'warn');
+  } catch (e) { toast(T('keys.not_added'), 'bad', e.message); }
 }
 function renderArchive() {
   const body = document.getElementById('archiveBody');
@@ -2669,8 +2710,7 @@ function renderArchive() {
 
   if (profiles.length === 0) {
     body.className = '';
-    body.innerHTML = `<div class="card"><div class="empty-state"><span class="em">🔑</span>ما كاين حتى مفتاح محفوظ بعد.<br>
-      جرب مفتاح فتبويب "اختبار" وضغط "💾 حفظ الحالي"، ولا ضغط "➕ زيد مفتاح".</div></div>`;
+    body.innerHTML = `<div class="card"><div class="empty-state"><span class="em">🔑</span>${T('keys.empty')}</div></div>`;
     return;
   }
   const q = (document.getElementById('keySearch')?.value || '').trim().toLowerCase();
@@ -2694,24 +2734,24 @@ function renderArchive() {
           <span class="kc-ic">${icons[st]}</span>
           <div class="kc-title">
             <div class="kc-name">${sourceUrl(p.source)
-              ? `<a class="kc-link" href="${escapeHtml(sourceUrl(p.source))}" target="_blank" rel="noopener noreferrer" title="فتح ${escapeHtml(sourceUrl(p.source))}">${escapeHtml(p.name)} <span class="ext">↗</span></a>`
-              : `<span title="حط رابط الموقع فـ «المصدر» باش يولي هاد الاسم رابط">${escapeHtml(p.name)}</span>`}</div>
-            <div class="kc-sub">⏱ ${timeAgo(p.lastCheck && p.lastCheck.timestamp)} · ${workingCount} موديل خدام</div>
+              ? `<a class="kc-link" href="${escapeHtml(sourceUrl(p.source))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(T('keys.open_url', { url: sourceUrl(p.source) }))}">${escapeHtml(p.name)} <span class="ext">↗</span></a>`
+              : `<span title="${escapeHtml(T('keys.link_hint'))}">${escapeHtml(p.name)}</span>`}</div>
+            <div class="kc-sub">⏱ ${timeAgo(p.lastCheck && p.lastCheck.timestamp)} · ${T('keys.working_count', { n: workingCount })}</div>
           </div>
           ${statusBadge(p)}
         </div>
         <div class="kcard-body">
           <div class="kv-row"><span class="k">URL</span>
             <span class="v" dir="ltr" title="${esc(p.base_url || '')}">${p.base_url ? escapeHtml(p.base_url) : '—'}</span>
-            <button class="mini-copy" title="نسخ الرابط" ${p.base_url ? '' : 'disabled'} onclick="copyRaw('${esc(p.base_url)}', this)">📋</button></div>
-          <div class="kv-row"><span class="k">Key</span>
+            <button class="mini-copy" title="${escapeHtml(T('keys.copy_url'))}" ${p.base_url ? '' : 'disabled'} onclick="copyRaw('${esc(p.base_url)}', this)">📋</button></div>
+          <div class="kv-row"><span class="k">${T('keys.lbl_key')}</span>
             <span class="v" id="akey-${i}" dir="ltr">${maskKey(p.api_key)}</span>
-            <button class="mini-copy" title="عرض/إخفاء" onclick="toggleKey(${i}, '${esc(p.api_key)}')">👁</button>
-            <button class="mini-copy" title="نسخ المفتاح" ${p.api_key ? '' : 'disabled'} onclick="copyRaw('${esc(p.api_key)}', this)">📋</button></div>
-          <div class="kv-row"><span class="k">المصدر</span>
-            <input value="${esc(p.source)}" placeholder="فين خديتي هاد المفتاح؟ (رابط الموقع)" onchange="updateSource('${esc(p.name)}', this.value)"></div>
+            <button class="mini-copy" title="${escapeHtml(T('common.show_hide'))}" onclick="toggleKey(${i}, '${esc(p.api_key)}')">👁</button>
+            <button class="mini-copy" title="${escapeHtml(T('keys.copy_key'))}" ${p.api_key ? '' : 'disabled'} onclick="copyRaw('${esc(p.api_key)}', this)">📋</button></div>
+          <div class="kv-row"><span class="k">${T('keys.lbl_source')}</span>
+            <input value="${esc(p.source)}" placeholder="${escapeHtml(T('keys.source_ph'))}" onchange="updateSource('${esc(p.name)}', this.value)"></div>
           <div class="kc-models-block">
-            <div class="lbl">الموديلات الخدامة (من الأسرع)</div>
+            <div class="lbl">${T('keys.models_label')}</div>
             ${modelTags(p.lastCheck && p.lastCheck.working, p.name)}
             ${diffLine(p)}
             ${err}
@@ -2719,21 +2759,21 @@ function renderArchive() {
         </div>
         <div class="kcard-foot">
           <div class="copy-dd" id="copydd-${i}">
-            <button id="copybtn-${i}" ${canCopy ? '' : 'disabled style="opacity:.4;cursor:not-allowed"'} onclick="toggleCopyMenu(event, ${i})">📋 نسخ الإعداد</button>
+            <button id="copybtn-${i}" ${canCopy ? '' : 'disabled style="opacity:.4;cursor:not-allowed"'} onclick="toggleCopyMenu(event, ${i})">${T('test.copy_config')}</button>
             <div class="dd-menu">
               <button class="dd-item" ${canCopy ? '' : 'disabled'} onclick="copyProfileConfig('${esc(p.name)}', ${i}, 'opencode')"><span class="em">🧪</span> opencode</button>
               <button class="dd-item" ${canCopy ? '' : 'disabled'} onclick="copyProfileConfig('${esc(p.name)}', ${i}, 'piagent')"><span class="em">🪶</span> pi agent</button>
               <button class="dd-item" ${canCopy ? '' : 'disabled'} onclick="copyProfileConfig('${esc(p.name)}', ${i}, 'hermes')"><span class="em">🪽</span> hermes</button>
               ${fmtItems ? '<div class="dd-sep"></div>' + fmtItems : ''}
               <div class="dd-sep"></div>
-              <button class="dd-item" ${canCopy ? '' : 'disabled'} onclick="copyProfileConfig('${esc(p.name)}', ${i}, 'custom')"><span class="em">✏️</span> قالب مخصص...</button>
+              <button class="dd-item" ${canCopy ? '' : 'disabled'} onclick="copyProfileConfig('${esc(p.name)}', ${i}, 'custom')"><span class="em">✏️</span> ${T('keys.custom_tpl')}</button>
             </div>
           </div>
           <span class="spacer"></span>
-          <button class="icon-act" title="فتح فتبويب الاختبار" onclick="loadFromArchive('${esc(p.name)}')">⬆</button>
-          <button class="icon-act" title="فحص دابا" onclick="checkProfileNow('${esc(p.name)}')">🔄</button>
-          <button class="icon-act" title="زيدو كمزود فالـ gateway" onclick="sendProfileToGateway('${esc(p.name)}')">🚪</button>
-          <button class="icon-act danger" title="حذف" onclick="deleteFromArchive('${esc(p.name)}')">🗑</button>
+          <button class="icon-act" title="${escapeHtml(T('keys.open_tester'))}" onclick="loadFromArchive('${esc(p.name)}')">⬆</button>
+          <button class="icon-act" title="${escapeHtml(T('keys.check_now'))}" onclick="checkProfileNow('${esc(p.name)}')">🔄</button>
+          <button class="icon-act" title="${escapeHtml(T('keys.to_gw'))}" onclick="sendProfileToGateway('${esc(p.name)}')">🚪</button>
+          <button class="icon-act danger" title="${escapeHtml(T('common.delete'))}" onclick="deleteFromArchive('${esc(p.name)}')">🗑</button>
         </div>
       </div>`;
     });
@@ -2741,7 +2781,7 @@ function renderArchive() {
   const typing = act && act.classList.contains('models-search')
     ? { key: act.dataset.key, a: act.selectionStart, b: act.selectionEnd } : null;
   body.className = 'key-grid';
-  body.innerHTML = cards.join('') || '<div class="card keys-empty"><div class="empty-state">ما كاين حتى مفتاح كيطابق هاد الفلتر.</div></div>';
+  body.innerHTML = cards.join('') || '<div class="card keys-empty"><div class="empty-state">' + T('keys.no_match') + '</div></div>';
   body.querySelectorAll('.models-search').forEach(inp => {
     if (inp.value) filterModels(inp);
     if (typing && inp.dataset.key === typing.key) { inp.focus(); inp.setSelectionRange(typing.a, typing.b); }
@@ -2768,7 +2808,7 @@ function updateSource(name, val) {
   const p = profiles.find(x => x.name === name);
   if (p) { p.source = val; setProfiles(profiles); renderArchive(); }
 }
-// "المصدر" as a link: a full http(s) URL, or a bare domain like openrouter.ai/keys. Anything else is plain text.
+// The "source" field as a link: a full http(s) URL, or a bare domain like openrouter.ai/keys. Anything else is plain text.
 function sourceUrl(src) {
   const t = String(src || '').trim();
   if (!t || /\s/.test(t)) return '';
@@ -2783,10 +2823,10 @@ function loadFromArchive(name) {
   refreshProfileSelect(name); applyProfile(); closeArchive();
 }
 function deleteFromArchive(name) {
-  if (!confirm(`متأكد بغيتي تحذف "${name}"؟`)) return;
+  if (!confirm(T('common.confirm_delete', { name }))) return;
   setProfiles(getProfiles().filter(p => p.name !== name));
   refreshProfileSelect(); renderArchive(); updateKeyStats();
-  toast(`تم حذف "${name}"`, 'warn');
+  toast(T('common.deleted_name', { name }), 'warn');
 }
 async function copyProfileConfig(name, i, fmt) {
   const profile = getProfiles().find(p => p.name === name);
@@ -2797,7 +2837,7 @@ async function copyProfileConfig(name, i, fmt) {
     if (workingList.length) {
       const models = workingList.map(normalizeWorkingEntry).map(w => w.model);
       if (fmt === 'custom') {
-        const tpl = prompt('اكتب القالب مع {{url}} و {{key}} و {{models}}:',
+        const tpl = prompt(T('copy.tpl_prompt'),
           '{\n  "url": "{{url}}",\n  "key": "{{key}}",\n  "models": {{models}}\n}');
         if (!tpl) return;
         text = buildConfigFromTemplate(tpl, profile, models);
@@ -2811,7 +2851,7 @@ async function copyProfileConfig(name, i, fmt) {
     const dd = document.getElementById('copydd-' + i);
     const btn = dd && dd.querySelector(':scope > button');
     if (btn) flashCopied(btn);
-    toast('تم نسخ ' + (fmt || 'opencode'), 'ok');
+    toast(T('copy.done', { what: fmt || 'opencode' }), 'ok');
   }
 }
 function toggleCopyMenu(e, i) {
@@ -2899,15 +2939,15 @@ async function checkProfile(name) {
   // ---- LIVE NOTIFICATION on change ----
   if (hadBefore) {
     if (!result.errorMessage && removed.length)
-      toast(`${name}: توقف موديل`, 'bad', 'توقف: ' + removed.join(', '));
+      toast(T('notify.model_stopped', { name }), 'bad', T('notify.stopped_list', { list: removed.join(', ') }));
     if (!result.errorMessage && added.length)
-      toast(`${name}: موديل جديد`, 'ok', 'زاد: ' + added.join(', '));
+      toast(T('notify.new_model', { name }), 'ok', T('notify.added_list', { list: added.join(', ') }));
     if (result.errorMessage)
-      toast(`${name}: المفتاح متوقف`, 'bad', result.errorMessage);
+      toast(T('notify.key_down', { name }), 'bad', result.errorMessage);
     if (!result.errorMessage && !added.length && !removed.length && result.working.length)
-      toast(`${name}: كل شيء بخير`, 'ok');
+      toast(T('notify.all_good', { name }), 'ok');
   } else if (result.working.length) {
-    toast(`${name}: ${result.working.length} موديل خدام`, 'ok');
+    toast(T('notify.working', { name, n: result.working.length }), 'ok');
   }
   updateKeyStats();
 }
@@ -2917,9 +2957,9 @@ async function checkProfileNow(name) {
   await checkProfile(name); renderArchive();
 }
 async function checkAllProfiles() {
-  if (monitorBusy) { toast('الفحص باقي خدام، تسنى حتى يسالي.', 'warn'); return; }
+  if (monitorBusy) { toast(T('monitor.busy'), 'warn'); return; }
   const names = getProfiles().map(p => p.name);
-  if (names.length === 0) { toast('ما كاين حتى ملف محفوظ باش يتفحص.', 'warn'); return; }
+  if (names.length === 0) { toast(T('monitor.nothing'), 'warn'); return; }
   monitorBusy = true;
   const btn = document.getElementById('checkAllBtn');
   if (btn) btn.disabled = true;
@@ -2931,7 +2971,7 @@ async function checkAllProfiles() {
       while (queue.length) { const name = queue.shift(); await checkProfile(name); renderArchive(); }
     };
     await Promise.all([worker(), worker()]);
-    toast(`تم فحص ${names.length} مفتاح.`, 'info');
+    toast(T('monitor.checked', { n: names.length }), 'info');
   } finally {
     monitorBusy = false;
     if (btn) btn.disabled = false;
@@ -2964,7 +3004,7 @@ function toggleMonitor() {
   s.enabled = !s.enabled; setMonitorSettings(s);
   syncMonitorUI();
   if (s.enabled) startMonitor(s.intervalMinutes); else stopMonitor();
-  toast(s.enabled ? `تم تشغيل المراقبة (كل ${s.intervalMinutes} د)` : 'تم إيقاف المراقبة', s.enabled ? 'ok' : 'warn');
+  toast(s.enabled ? T('monitor.started', { n: s.intervalMinutes }) : T('monitor.stopped'), s.enabled ? 'ok' : 'warn');
 }
 function startMonitor(minutes) {
   stopMonitor();
@@ -2976,7 +3016,7 @@ function startMonitor(minutes) {
     updateNextRunLabel();
   }, minutes * 60000);
 }
-const MONITOR_IDLE_TEXT = 'متوقفة. ملي تشغلها، كتفحص كل المفاتيح وحدها وكتنبهك ملي يتبدل شي حاجة.';
+const MONITOR_IDLE_TEXT = T('monitor.idle');
 function stopMonitor() {
   if (monitorTimerId) clearInterval(monitorTimerId);
   monitorTimerId = null; monitorNextRunAt = null;
@@ -2987,7 +3027,7 @@ function updateNextRunLabel() {
   if (!monitorNextRunAt) { el.textContent = MONITOR_IDLE_TEXT; return; }
   const secsLeft = Math.max(0, Math.round((monitorNextRunAt - Date.now()) / 1000));
   const mins = Math.floor(secsLeft / 60), secs = secsLeft % 60;
-  el.textContent = `الفحص الجاي بعد ${mins}:${secs.toString().padStart(2,'0')}`;
+  el.textContent = T('monitor.next', { time: `${mins}:${secs.toString().padStart(2,'0')}` });
 }
 function syncMonitorUI() {
   const s = getMonitorSettings();
@@ -2995,7 +3035,7 @@ function syncMonitorUI() {
   const btn = document.getElementById('liveToggleBtn');
   const tgl = document.getElementById('monitorToggle');
   if (pulse) pulse.classList.toggle('paused', !s.enabled);
-  if (btn) btn.textContent = s.enabled ? '⏸ إيقاف المراقبة' : '▶ تشغيل المراقبة';
+  if (btn) btn.textContent = s.enabled ? T('keys.monitor_stop') : T('keys.monitor_start');
   if (tgl) tgl.classList.toggle('on', s.enabled);
   syncIntervalSeg(s.intervalMinutes);
   if (s.enabled && !monitorTimerId) startMonitor(s.intervalMinutes);
@@ -3021,9 +3061,9 @@ function closeFormats() { document.getElementById('formatsOverlay').classList.re
 function saveFormat() {
   const name = document.getElementById('formatName').value.trim();
   const raw = document.getElementById('formatTemplate').value.trim();
-  if (!name) { toast('عمر اسم الصيغة.', 'warn'); return; }
+  if (!name) { toast(T('formats.need_name'), 'warn'); return; }
   let template;
-  try { template = JSON.parse(raw); } catch(e) { toast('المثال JSON خاطئ: ' + e.message, 'bad'); return; }
+  try { template = JSON.parse(raw); } catch(e) { toast(T('formats.bad_json', { error: e.message }), 'bad'); return; }
   const formats = getFormats();
   const idx = formats.findIndex(f => f.name === name);
   const entry = { name, template };
@@ -3032,21 +3072,21 @@ function saveFormat() {
   document.getElementById('formatName').value = '';
   document.getElementById('formatTemplate').value = '';
   renderFormatsList(); refreshCopyDD();
-  toast(`تم حفظ صيغة "${name}"`, 'ok');
+  toast(T('formats.saved', { name }), 'ok');
 }
 function deleteFormat(name) {
-  if (!confirm(`متأكد بغيتي تحذف صيغة "${name}"؟`)) return;
+  if (!confirm(T('formats.confirm_delete', { name }))) return;
   setFormats(getFormats().filter(f => f.name !== name));
   renderFormatsList(); renderArchive(); refreshCopyDD();
 }
 function renderFormatsList() {
   const body = document.getElementById('formatsListBody');
   const formats = getFormats();
-  if (formats.length === 0) { body.innerHTML = '<div class="empty-state">ما كاين حتى صيغة محفوظة بعد.</div>'; return; }
+  if (formats.length === 0) { body.innerHTML = `<div class="empty-state">${T('formats.empty')}</div>`; return; }
   body.innerHTML = formats.map(f => `
     <div class="side-section" style="margin-bottom:10px;">
       <div class="side-section-title">🧩 ${escapeHtml(f.name)}</div>
-      <div class="action-grid"><button class="ghost" onclick="deleteFormat('${esc(f.name)}')">🗑 حذف</button></div>
+      <div class="action-grid"><button class="ghost" onclick="deleteFormat('${esc(f.name)}')">${T('common.delete_btn')}</button></div>
     </div>`).join('');
 }
 
@@ -3091,11 +3131,11 @@ async function copyCustomFormat(profileName, formatName, elId) {
   const format = getFormats().find(f => f.name === formatName);
   if (!profile || !format) return;
   const workingList = (profile.lastCheck && profile.lastCheck.working) || [];
-  if (!workingList.length) { toast('ما كاين حتى موديل خدام باش ننسخو.', 'warn'); return; }
+  if (!workingList.length) { toast(T('copy.no_working_copy'), 'warn'); return; }
   const models = workingList.map(normalizeWorkingEntry).map(w => w.model);
   const config = buildConfigFromTemplate(format.template, profile, models);
   const ok = await copyToClipboard(JSON.stringify(config, null, 2));
-  if (ok) { const b = document.getElementById(elId); flashCopied(b); toast(`تم نسخ ${formatName}`, 'ok'); }
+  if (ok) { const b = document.getElementById(elId); flashCopied(b); toast(T('copy.done', { what: formatName }), 'ok'); }
 }
 
 /* =========================================================================
@@ -3113,25 +3153,25 @@ function refreshCopyDD() {
   // keep built-in items, add custom formats
   const ready = !!lastConfig;
   let html = `
-    <button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('opencode')"><span class="em">🧪</span> نسخ opencode config</button>
-    <button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('names')"><span class="em">📝</span> نسخ أسماء الموديلات الخدامة</button>`;
+    <button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('opencode')"><span class="em">🧪</span> ${T('copy.opencode')}</button>
+    <button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('names')"><span class="em">📝</span> ${T('copy.names')}</button>`;
   formats.forEach(f => {
-    html += `<button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('fmt:${esc(f.name)}')"><span class="em">🧩</span> نسخ ${escapeHtml(f.name)}</button>`;
+    html += `<button class="dd-item" ${ready ? '' : 'disabled'} onclick="pickCopy('fmt:${esc(f.name)}')"><span class="em">🧩</span> ${T('copy.fmt', { name: escapeHtml(f.name) })}</button>`;
   });
   menu.innerHTML = html;
 }
 async function pickCopy(target) {
   document.getElementById('copyDD').classList.remove('open');
   if (target === 'opencode') {
-    if (lastConfig) { await copyToClipboard(JSON.stringify(lastConfig, null, 2)); toast('تم نسخ opencode config', 'ok'); }
-    else toast('ما كاين حتى config بعد. شغّل الاختبار أولاً.', 'warn');
+    if (lastConfig) { await copyToClipboard(JSON.stringify(lastConfig, null, 2)); toast(T('copy.done', { what: 'opencode config' }), 'ok'); }
+    else toast(T('copy.no_config'), 'warn');
     return;
   }
   const workingNames = [...lastResults.working]
     .sort((a,b) => a.response_time_avg - b.response_time_avg).map(r => r.model);
   if (target === 'names') {
-    if (!workingNames.length) { toast('ما كاين حتى موديل خدام.', 'warn'); return; }
-    await copyToClipboard(workingNames.join(', ')); toast(`تم نسخ ${workingNames.length} موديل`, 'ok');
+    if (!workingNames.length) { toast(T('copy.no_working'), 'warn'); return; }
+    await copyToClipboard(workingNames.join(', ')); toast(T('copy.n_models', { n: workingNames.length }), 'ok');
     return;
   }
   if (target.startsWith('fmt:')) {
@@ -3139,11 +3179,11 @@ async function pickCopy(target) {
     const fname = target.slice(4);
     const format = getFormats().find(f => f.name === fname);
     if (!format) return;
-    if (!workingNames.length) { toast('شغّل الاختبار أولاً باش يكونو موديلات خدامين.', 'warn'); return; }
+    if (!workingNames.length) { toast(T('copy.run_first'), 'warn'); return; }
     const profile = currentFormValues();
     const config = buildConfigFromTemplate(format.template, profile, workingNames);
     const ok = await copyToClipboard(JSON.stringify(config, null, 2));
-    if (ok) toast(`تم نسخ ${fname}`, 'ok');
+    if (ok) toast(T('copy.done', { what: fname }), 'ok');
   }
 }
 
@@ -3165,14 +3205,14 @@ function addRow(model) {
   tr.id = rowId(model);
   tr.dataset.model = model;
   tr.dataset.state = 'pending';
-  tr.innerHTML = `<td>${modelCell(model, '')}</td><td><span class="pill pending">كيتجرب...</span></td><td>—</td><td>—</td><td>—</td>`;
+  tr.innerHTML = `<td>${modelCell(model, '')}</td><td><span class="pill pending">${T('row.testing')}</span></td><td>—</td><td>—</td><td>—</td>`;
   document.getElementById('tbody').appendChild(tr);
   applyResultFilter();
   return tr;
 }
 function modelCell(model, rank) {
   return `<div class="model-cell"><span class="rank">${rank}</span><span>${escapeHtml(model)}</span>` +
-         `<button class="mini-copy" title="نسخ اسم الموديل" onclick="copyRaw('${esc(model)}', this)">📋</button></div>`;
+         `<button class="mini-copy" title="${escapeHtml(T('row.copy_model'))}" onclick="copyRaw('${esc(model)}', this)">📋</button></div>`;
 }
 function updateRow(result) {
   const id = rowId(result.model);
@@ -3182,24 +3222,24 @@ function updateRow(result) {
   if (isOk) { maxTime = Math.max(maxTime, result.response_time_avg); lastResults.working.push(result); }
   else lastResults.failed.push(result);
   const labels = {
-    KEY_INVALID: 'المفتاح مرفوض', MODEL_UNAVAILABLE: 'موديل غير متاح',
-    LIMITED: 'حدّ الاستخدام', UNAVAILABLE: 'الخدمة مؤقتاً',
-    INCOMPATIBLE: 'طلب غير متوافق', INVALID_RESPONSE: 'رد غير مفهوم', FAILED: 'فشل'
+    KEY_INVALID: T('st.KEY_INVALID'), MODEL_UNAVAILABLE: T('st.MODEL_UNAVAILABLE'),
+    LIMITED: T('st.LIMITED'), UNAVAILABLE: T('st.UNAVAILABLE'),
+    INCOMPATIBLE: T('st.INCOMPATIBLE'), INVALID_RESPONSE: T('st.INVALID_RESPONSE'), FAILED: T('st.FAILED')
   };
   const transient = ['LIMITED', 'UNAVAILABLE', 'INCOMPATIBLE'].includes(result.status);
-  const statusLabel = isOk ? 'يعمل' : (labels[result.status] || 'فشل');
+  const statusLabel = isOk ? T('st.WORKING') : (labels[result.status] || T('st.FAILED'));
   tr.dataset.state = isOk ? 'ok' : 'bad';
   tr.classList.remove('flash'); void tr.offsetWidth; tr.classList.add('flash');
   const extra = [];
   if (isOk && result.runs > 1) extra.push(`min ${result.response_time_min}s · max ${result.response_time_max}s`);
-  if (isOk && result.ttft != null) extra.push(`أول token: ${result.ttft}s`);
+  if (isOk && result.ttft != null) extra.push(T('row.first_token', { t: result.ttft }));
   tr.innerHTML = `
     <td>${modelCell(result.model, '')}</td>
     <td><span class="pill ${isOk ? 'ok' : (transient ? 'pending' : 'bad')}">${statusLabel}</span></td>
     <td>${isOk
         ? `<div class="bar-cell"><span>${result.response_time_avg}s</span><div class="bar-track"><div class="bar-fill" data-time="${result.response_time_avg}"></div></div></div>${extra.length ? `<span class="sub-metric">${escapeHtml(extra.join(' · '))}</span>` : ''}`
-        : `<div class="result-diagnosis"><strong>${escapeHtml(result.error || statusLabel)}</strong><small>HTTP ${escapeHtml(result.code || 0)}</small>${result.technical_error ? `<span title="${escapeHtml(result.technical_error)}">التفاصيل التقنية متاحة عند تمرير المؤشر</span>` : ''}</div>`}</td>
-    <td>${isOk && result.tokens_per_sec ? result.tokens_per_sec : `<span title="${isOk ? 'فعّل كشف القدرات باش تتقاس السرعة الحقيقية' : ''}">—</span>`}</td>
+        : `<div class="result-diagnosis"><strong>${escapeHtml(result.error || statusLabel)}</strong><small>HTTP ${escapeHtml(result.code || 0)}</small>${result.technical_error ? `<span title="${escapeHtml(result.technical_error)}">${T('row.tech_details')}</span>` : ''}</div>`}</td>
+    <td>${isOk && result.tokens_per_sec ? result.tokens_per_sec : `<span title="${isOk ? escapeHtml(T('row.enable_caps')) : ''}">—</span>`}</td>
     <td>${isOk ? capBadges(result.capabilities) : '—'}</td>`;
   refreshBars();
   updateChart();
@@ -3255,7 +3295,7 @@ function updateChart() {
   const wrap = document.getElementById('chart');
   if (!wrap) return;
   if (!lastResults.working.length) {
-    wrap.innerHTML = '<div class="chart-empty" style="width:100%;">النتائج غادي تظهر هنا بعد التشغيل</div>';
+    wrap.innerHTML = `<div class="chart-empty" style="width:100%;">${T('test.chart_empty')}</div>`;
     return;
   }
   const data = [...lastResults.working].sort((a,b) => a.response_time_avg - b.response_time_avg);
@@ -3279,7 +3319,7 @@ function runOrStop() {
 function setRunButton(running) {
   const btn = document.getElementById('runBtn');
   btn.classList.toggle('stop', running);
-  btn.textContent = running ? '⏹ وقّف الاختبار' : '▶ شغّل الاختبار';
+  btn.textContent = running ? T('test.stop') : T('test.run');
 }
 function showBanner(data) {
   const banner = document.getElementById('resultBanner');
@@ -3288,17 +3328,17 @@ function showBanner(data) {
   banner.classList.toggle('bad', !data.working);
   document.getElementById('bannerBig').textContent = `${data.working}/${data.total}`;
   document.getElementById('bannerTitle').textContent = data.working
-    ? `${data.working} موديل خدام من أصل ${data.total}` : 'حتى موديل ما خدام';
+    ? T('banner.n_working', { working: data.working, total: data.total }) : T('banner.none');
   const parts = [data.key_message];
-  if (fastest) parts.push(`الأسرع: ${fastest.model} (${fastest.response_time_avg}s)`);
-  parts.push(`المدة: ${data.total_time_seconds}s`);
+  if (fastest) parts.push(T('banner.fastest', { model: fastest.model, t: fastest.response_time_avg }));
+  parts.push(T('banner.duration', { t: data.total_time_seconds }));
   document.getElementById('bannerSub').textContent = parts.join(' · ');
   banner.classList.add('show');
 }
 async function runTest() {
   if (!document.getElementById('base_url').value.trim() || !document.getElementById('api_key').value.trim()) {
-    setStatus('عمر Base URL و API Key قبل ما تشغّل الاختبار.', true);
-    toast('عمر Base URL و API Key أولاً.', 'warn');
+    setStatus(T('run.fill'), true);
+    toast(T('run.fill_toast'), 'warn');
     return;
   }
   currentRun = new AbortController();
@@ -3329,7 +3369,7 @@ async function runTest() {
   };
 
   try {
-    setStatus('كيتصل بالسيرفر...', false, true);
+    setStatus(T('run.connecting'), false, true);
     const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Console': '1' },
                                            body: JSON.stringify(payload), signal: currentRun.signal });
     const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
@@ -3345,10 +3385,10 @@ async function runTest() {
       document.getElementById('statTime').textContent = secs + 's';
       document.querySelectorAll('#tbody tr[data-state="pending"]').forEach(tr => tr.remove());
       sortResultRows(); updateLiveCounts();
-      setStatus(`تم إيقاف الاختبار. ${lastResults.working.length} خدام و ${lastResults.failed.length} فاشل قبل الإيقاف.`, false, false);
+      setStatus(T('run.stopped', { ok: lastResults.working.length, bad: lastResults.failed.length }), false, false);
       if (lastResults.working.length || lastResults.failed.length) document.getElementById('dlReport').disabled = false;
     } else {
-      setStatus('خطأ فالاتصال بالسيرفر: ' + e.message, true);
+      setStatus(T('run.conn_error', { error: e.message }), true);
     }
   } finally {
     currentRun = null;
@@ -3361,7 +3401,7 @@ function handleEvent(evt) {
   if (evt.type === 'status') setStatus(evt.data.message, false, true);
   else if (evt.type === 'error') setStatus(evt.data.message, true);
   else if (evt.type === 'models_found') {
-    setStatus(`كنتستى ${evt.data.count} موديل...`, false, true);
+    setStatus(T('run.testing_n', { n: evt.data.count }), false, true);
     evt.data.models.forEach(addRow);
     updateLiveCounts();
   }
@@ -3369,7 +3409,7 @@ function handleEvent(evt) {
     updateRow(evt.data);
     const done = lastResults.working.length + lastResults.failed.length;
     const total = document.querySelectorAll('#tbody tr[data-state]').length;
-    setStatus(`كنتستى الموديلات... ${done}/${total}`, false, true);
+    setStatus(T('run.progress', { done, total }), false, true);
   }
   else if (evt.type === 'summary') {
     document.getElementById('statWorking').textContent = evt.data.working;
@@ -3383,9 +3423,9 @@ function handleEvent(evt) {
     showBanner(evt.data);
     // The banner already carries the details; keep the status line short.
     setStatus(evt.data.key_status === 'INVALID' ? evt.data.key_message
-              : `سالا الاختبار فـ ${evt.data.total_time_seconds}s.`, evt.data.key_status === 'INVALID', false);
-    if (evt.data.working > 0) toast(`الاختبار سالي: ${evt.data.working}/${evt.data.total} خدام`, 'ok');
-    else toast('حتى موديل ما خدام.', 'warn');
+              : T('run.finished', { t: evt.data.total_time_seconds }), evt.data.key_status === 'INVALID', false);
+    if (evt.data.working > 0) toast(T('run.done_toast', { working: evt.data.working, total: evt.data.total }), 'ok');
+    else toast(T('run.none_toast'), 'warn');
   }
   else if (evt.type === 'done') { /* end */ }
 }
@@ -3404,7 +3444,7 @@ function downloadReport() { downloadBlob(lastResults, 'test_report.json'); }
 /* =========================================================================
    SETTINGS MODAL
    ========================================================================= */
-function openSettings() { applyTheme(); applyToastUI(); syncMonitorUI(); loadTelegram(); document.getElementById('settingsOverlay').classList.add('open'); }
+function openSettings() { applyTheme(); applyToastUI(); syncMonitorUI(); syncLangUI(); loadTelegram(); document.getElementById('settingsOverlay').classList.add('open'); }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
 
 /* ---- phone access: LAN listener + QR, token in the link (cookie after the first visit) ---- */
@@ -3506,8 +3546,8 @@ let logFilter = 'all';
 let logsTimer = null;
 let showLocalKey = false;
 const KEY_STATUS = {
-  ok: ['ok', 'خدام'], unknown: ['pending', 'ما تختبرش'], invalid: ['bad', 'مرفوض'],
-  limited: ['pending', 'وصل للحد'], no_credit: ['bad', 'ما بقاش الرصيد'], error: ['bad', 'خطأ'],
+  ok: ['ok', T('ks.ok')], unknown: ['pending', T('ks.unknown')], invalid: ['bad', T('ks.invalid')],
+  limited: ['pending', T('ks.limited')], no_credit: ['bad', T('ks.no_credit')], error: ['bad', T('common.error')],
 };
 
 async function api(path, body) {
@@ -3522,7 +3562,7 @@ async function api(path, body) {
 
 async function loadGateway() {
   try { gwState = await api('/api/gateway/state'); }
-  catch (e) { toast('ما قدرتش نقرا حالة الـ gateway', 'bad', e.message); return; }
+  catch (e) { toast(T('gw.state_failed'), 'bad', e.message); return; }
   renderProviders(); renderGatewayInfo();
 }
 
@@ -3544,7 +3584,7 @@ function renderProviders() {
   if (!wrap || !gwState) return;
   const list = gwState.providers;
   if (!list.length) {
-    wrap.innerHTML = '<div class="card"><div class="empty-state"><span class="em">🔌</span>ما كاين حتى مزود بعد.<br>زيد مزود بالرابط ديالو، ومن بعد زيد المفاتيح ديالو.</div></div>';
+    wrap.innerHTML = `<div class="card"><div class="empty-state"><span class="em">🔌</span>${T('prov.empty')}</div></div>`;
     return;
   }
   wrap.innerHTML = list.map(p => {
@@ -3553,58 +3593,58 @@ function renderProviders() {
       const [cls, label] = KEY_STATUS[k.status] || ['pending', k.status];
       const cool = k.cooldown_left > 0 ? ` · ${fmtSecs(k.cooldown_left)}` : '';
       return `<div class="key-row">
-        <span class="star" title="المفتاح لي كيستعمل دابا">${k.active ? '★' : ''}</span>
+        <span class="star" title="${escapeHtml(T('prov.active_key'))}">${k.active ? '★' : ''}</span>
         <span class="mk" dir="ltr" title="${escapeHtml(k.label || '')}">${escapeHtml(k.masked)}</span>
         <span class="st"><span class="pill ${cls}">${label}${cool}</span></span>
-        <span class="err" title="${escapeHtml(k.last_error || '')}">${escapeHtml(k.last_error || (k.last_checked ? 'تختبر ' + timeAgo(k.last_checked * 1000) : ''))}</span>
+        <span class="err" title="${escapeHtml(k.last_error || '')}">${escapeHtml(k.last_error || (k.last_checked ? T('prov.tested_ago', { ago: timeAgo(k.last_checked * 1000) }) : ''))}</span>
         <span class="acts">
-          <button class="ghost" title="اختبار كامل فتبويب الاختبار" onclick="openKeyInTester('${esc(p.id)}', '${esc(k.id)}')">🔬</button>
-          <button class="ghost" title="حذف المفتاح" onclick="deleteProviderKey('${esc(p.id)}', '${esc(k.id)}')">🗑</button>
+          <button class="ghost" title="${escapeHtml(T('prov.full_test'))}" onclick="openKeyInTester('${esc(p.id)}', '${esc(k.id)}')">🔬</button>
+          <button class="ghost" title="${escapeHtml(T('prov.delete_key'))}" onclick="deleteProviderKey('${esc(p.id)}', '${esc(k.id)}')">🗑</button>
         </span>
         ${quotaHtml(k.quota)}
       </div>`;
-    }).join('') || '<div class="empty-state" style="padding:14px;">ما كاين حتى مفتاح.</div>';
+    }).join('') || `<div class="empty-state" style="padding:14px;">${T('prov.no_keys')}</div>`;
     const models = p.models.length
       ? `<div class="model-tags" style="margin:0 0 10px;">${p.models.slice(0, 24).map(m => `<span class="model-tag">${escapeHtml(m)}</span>`).join('')}${p.models.length > 24 ? `<span class="model-tag">+${p.models.length - 24}</span>` : ''}</div>`
-      : '<p class="modal-desc" style="margin:0 0 10px;">الموديلات كيتجابو ملي تختبر المفاتيح.</p>';
+      : `<p class="modal-desc" style="margin:0 0 10px;">${T('prov.models_later')}</p>`;
     return `<div class="prov-card ${p.enabled ? '' : 'off'}">
       <div class="prov-head">
         <span class="name">${escapeHtml(p.name)}</span>
         <span class="fmt-badge">${p.format === 'anthropic' ? 'Anthropic' : 'OpenAI'}</span>
-        <span class="pill ${ok ? 'ok' : 'pending'}">${ok}/${p.keys.length} خدام</span>
+        <span class="pill ${ok ? 'ok' : 'pending'}">${T('prov.n_ok', { ok, n: p.keys.length })}</span>
         <span class="url" dir="ltr">${escapeHtml(p.base_url)}</span>
         <span class="acts">
-          <button class="ghost" id="test-${escapeHtml(p.id)}" onclick="testProvider('${esc(p.id)}')">🧪 اختبر المفاتيح</button>
-          <button class="ghost" onclick="editProvider('${esc(p.id)}')">✏️</button>
-          <button class="ghost" onclick="toggleProvider('${esc(p.id)}')">${p.enabled ? '⏸' : '▶'}</button>
-          <button class="ghost" onclick="deleteProvider('${esc(p.id)}')">🗑</button>
+          <button class="ghost" id="test-${escapeHtml(p.id)}" onclick="testProvider('${esc(p.id)}')">${T('prov.test_keys')}</button>
+          <button class="ghost" title="${escapeHtml(T('common.edit'))}" onclick="editProvider('${esc(p.id)}')">✏️</button>
+          <button class="ghost" title="${escapeHtml(T(p.enabled ? 'prov.pause' : 'prov.resume'))}" onclick="toggleProvider('${esc(p.id)}')">${p.enabled ? '⏸' : '▶'}</button>
+          <button class="ghost" title="${escapeHtml(T('common.delete'))}" onclick="deleteProvider('${esc(p.id)}')">🗑</button>
         </span>
       </div>
       <div class="prov-body">
         ${models}
         ${keys}
         <div class="add-keys-box">
-          <label for="addkeys-${escapeHtml(p.id)}">➕ زيد مفتاح آخر لـ ${escapeHtml(p.name)} <span class="hint-inline">(نفس الرابط، ولا بزاف: واحد فكل سطر)</span></label>
+          <label for="addkeys-${escapeHtml(p.id)}">${T('prov.add_more', { name: escapeHtml(p.name) })} <span class="hint-inline">${T('prov.add_more_hint')}</span></label>
           <div class="add-keys">
             <textarea id="addkeys-${escapeHtml(p.id)}" class="masked" dir="ltr" rows="1" spellcheck="false" autocomplete="off"
-              placeholder="لصق المفتاح هنا" oninput="checkNewKeys('${esc(p.id)}')"
+              placeholder="${escapeHtml(T('prov.paste_ph'))}" oninput="checkNewKeys('${esc(p.id)}')"
               onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();event.stopPropagation();addProviderKeys('${esc(p.id)}');}"></textarea>
-            <button type="button" class="btn-icon" title="عرض/إخفاء" onclick="toggleAddKeysMask('${esc(p.id)}', this)">👁</button>
-            <button class="primary add-btn" id="addkeys-btn-${escapeHtml(p.id)}" disabled onclick="addProviderKeys('${esc(p.id)}')">➕ زيد المفتاح</button>
+            <button type="button" class="btn-icon" title="${escapeHtml(T('common.show_hide'))}" onclick="toggleAddKeysMask('${esc(p.id)}', this)">👁</button>
+            <button class="primary add-btn" id="addkeys-btn-${escapeHtml(p.id)}" disabled onclick="addProviderKeys('${esc(p.id)}')">${T('prov.add_btn')}</button>
           </div>
           <div class="add-keys-msg" id="addkeys-msg-${escapeHtml(p.id)}"></div>
         </div>
-        <p class="rotation-help">★ هو المفتاح لي خدام دابا، وكل الطلبات كتمشي ليه. إلا رجع خطأ (مرفوض، وصل للحد، سالا الرصيد، ولا الخدمة طاحت)، الـ gateway كيدوز للمفتاح لي موراه فنفس الطلب بلا ما يحس الوكيل، والمفتاح لي فشل كيترتاح شوية قبل ما يرجع يتجرب.</p>
+        <p class="rotation-help">${T('prov.rotation_help')}</p>
       </div>
     </div>`;
   }).join('');
 }
-function fmtSecs(s) { return s >= 60 ? `${Math.round(s / 60)} د` : `${s} ث`; }
+function fmtSecs(s) { return s >= 60 ? `${Math.round(s / 60)} ${T('unit.min')}` : `${s} ${T('unit.sec')}`; }
 
 function resetProviderForm() {
   ['prov_id', 'prov_name', 'prov_base', 'prov_models'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('prov_format').value = 'openai';
-  document.getElementById('provFormTitle').textContent = '➕ مزود جديد';
+  document.getElementById('provFormTitle').textContent = T('prov.new');
   document.getElementById('provFormCancel').style.display = 'none';
 }
 function editProvider(id) {
@@ -3614,7 +3654,7 @@ function editProvider(id) {
   document.getElementById('prov_base').value = p.base_url;
   document.getElementById('prov_format').value = p.format;
   document.getElementById('prov_models').value = (p.manual_models || []).join(', ');
-  document.getElementById('provFormTitle').textContent = '✏️ تعديل ' + p.name;
+  document.getElementById('provFormTitle').textContent = T('common.edit_title', { name: p.name });
   document.getElementById('provFormCancel').style.display = '';
   document.getElementById('prov_name').focus();
 }
@@ -3627,29 +3667,29 @@ async function saveProviderForm() {
     manual_models: document.getElementById('prov_models').value,
   };
   try { gwState = await api('/api/providers/save', body); }
-  catch (e) { toast('ما تحفظش المزود', 'bad', e.message); return; }
-  toast(`تم حفظ "${body.name}"`, 'ok');
+  catch (e) { toast(T('prov.save_failed'), 'bad', e.message); return; }
+  toast(T('common.saved_name', { name: body.name }), 'ok');
   resetProviderForm(); renderProviders(); renderGatewayInfo();
 }
 async function toggleProvider(id) {
   const p = gwState.providers.find(x => x.id === id); if (!p) return;
   try { gwState = await api('/api/providers/save', { id, name: p.name, base_url: p.base_url, format: p.format,
           manual_models: (p.manual_models || []).join(','), enabled: !p.enabled }); }
-  catch (e) { toast('خطأ', 'bad', e.message); return; }
+  catch (e) { toast(T('common.error'), 'bad', e.message); return; }
   renderProviders(); renderGatewayInfo();
 }
 async function deleteProvider(id) {
   const p = gwState.providers.find(x => x.id === id); if (!p) return;
-  if (!confirm(`تحذف المزود "${p.name}" مع ${p.keys.length} مفتاح؟`)) return;
+  if (!confirm(T('prov.confirm_delete', { name: p.name, n: p.keys.length }))) return;
   gwState = await api('/api/providers/delete', { id });
   renderProviders(); renderGatewayInfo();
 }
 const keyCheckTimers = {};
 function dupText(list) {
-  return list.map(d => `${d.masked} (فـ ${d.provider})`).join('، ');
+  return list.map(d => T('dup.item', { masked: d.masked, provider: d.provider })).join(T('common.list_sep'));
 }
 function dupHtml(list) {
-  return list.map(d => `<bdi dir="ltr">${escapeHtml(d.masked)}</bdi> (فـ ${escapeHtml(d.provider)})`).join('، ');
+  return list.map(d => T('dup.item', { masked: `<bdi dir="ltr">${escapeHtml(d.masked)}</bdi>`, provider: escapeHtml(d.provider) })).join(T('common.list_sep'));
 }
 function setAddKeysMsg(id, html, kind) {
   const el = document.getElementById('addkeys-msg-' + id);
@@ -3667,11 +3707,11 @@ function checkNewKeys(id) {
     try { r = await api('/api/providers/keys/check', { keys: ta.value }); } catch (e) { return; }
     btn.disabled = !r.new.length;
     if (r.existing.length && !r.new.length)
-      setAddKeysMsg(id, `⛔ هاد المفتاح ديجا موجود: ${dupHtml(r.existing)}. ما يمكنش تزيدو جوج مرات.`, 'bad');
+      setAddKeysMsg(id, T('addkeys.exists_only', { list: dupHtml(r.existing) }), 'bad');
     else if (r.existing.length)
-      setAddKeysMsg(id, `⚠️ ${r.new.length} جديد غادي يتزاد. هادو ديجا موجودين وغادي يتخطاو: ${dupHtml(r.existing)}`, 'warn');
+      setAddKeysMsg(id, T('addkeys.some_new', { n: r.new.length, list: dupHtml(r.existing) }), 'warn');
     else
-      setAddKeysMsg(id, `✓ ${r.new.length === 1 ? 'مفتاح جديد' : r.new.length + ' مفاتيح جداد'}، ضغط "زيد المفتاح" ولا Ctrl+Enter`, 'ok');
+      setAddKeysMsg(id, r.new.length === 1 ? T('addkeys.one_new') : T('addkeys.many_new', { n: r.new.length }), 'ok');
   }, 250);
 }
 function toggleAddKeysMask(id, btn) {
@@ -3681,46 +3721,46 @@ function toggleAddKeysMask(id, btn) {
 }
 async function addProviderKeys(id) {
   const ta = document.getElementById('addkeys-' + id);
-  if (!ta.value.trim()) { setAddKeysMsg(id, 'لصق المفتاح أولاً.', 'warn'); ta.focus(); return; }
+  if (!ta.value.trim()) { setAddKeysMsg(id, T('addkeys.paste_first'), 'warn'); ta.focus(); return; }
   let r;
   try { r = await api('/api/providers/keys/add', { provider_id: id, keys: ta.value }); }
   catch (e) { setAddKeysMsg(id, '⛔ ' + escapeHtml(e.message), 'bad'); return; }
   gwState = r;
   if (!r.added) {
     // Keep what was typed so the message stays next to it.
-    setAddKeysMsg(id, `⛔ ما تزاد والو: المفتاح ديجا موجود ${dupHtml(r.duplicates)}.`, 'bad');
-    toast('المفتاح ديجا موجود', 'warn', dupText(r.duplicates));
+    setAddKeysMsg(id, T('addkeys.none_added', { list: dupHtml(r.duplicates) }), 'bad');
+    toast(T('addkeys.exists_toast'), 'warn', dupText(r.duplicates));
     return;
   }
   renderProviders();
-  if (r.duplicates.length) setAddKeysMsg(id, `✓ تزاد ${r.added}. تخطيت ${r.duplicates.length} مكرر: ${dupHtml(r.duplicates)}`, 'warn');
-  else setAddKeysMsg(id, `✓ تزاد ${r.added} مفتاح. ضغط "🧪 اختبر المفاتيح" باش تعرف واش خدامين.`, 'ok');
-  toast(`تزاد ${r.added} مفتاح`, 'ok');
+  if (r.duplicates.length) setAddKeysMsg(id, T('addkeys.added_skipped', { added: r.added, n: r.duplicates.length, list: dupHtml(r.duplicates) }), 'warn');
+  else setAddKeysMsg(id, escapeHtml(T('addkeys.added', { n: r.added })), 'ok');
+  toast(T('addkeys.added_toast', { n: r.added }), 'ok');
 }
 async function deleteProviderKey(pid, kid) {
-  if (!confirm('تحذف هاد المفتاح من المزود؟')) return;
+  if (!confirm(T('prov.confirm_delete_key'))) return;
   gwState = await api('/api/providers/keys/delete', { provider_id: pid, key_id: kid });
   renderProviders();
 }
 async function testProvider(id) {
   const btn = document.getElementById('test-' + id);
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ كيتختبر...'; }
+  if (btn) { btn.disabled = true; btn.textContent = T('prov.testing'); }
   try {
     const r = await api('/api/providers/test', { id });
     gwState = r;
     const ok = r.results.filter(x => x.status === 'ok').length;
-    toast(`${ok}/${r.results.length} مفتاح خدام`, ok ? 'ok' : 'bad');
-  } catch (e) { toast('ما قدرتش نختبر', 'bad', e.message); }
+    toast(T('prov.test_result', { ok, n: r.results.length }), ok ? 'ok' : 'bad');
+  } catch (e) { toast(T('prov.test_failed'), 'bad', e.message); }
   renderProviders(); renderGatewayInfo();
 }
 async function importProfilesToGateway() {
   const profiles = getProfiles();
-  if (!profiles.length) { toast('ما كاين حتى ملف محفوظ.', 'warn'); return; }
+  if (!profiles.length) { toast(T('import.none'), 'warn'); return; }
   try {
     const r = await api('/api/providers/import', { profiles });
     gwState = r;
-    toast(`تزاد ${r.imported} مفتاح من ${profiles.length} ملف`, r.imported ? 'ok' : 'warn');
-  } catch (e) { toast('خطأ فالاستيراد', 'bad', e.message); return; }
+    toast(T('import.done', { n: r.imported, total: profiles.length }), r.imported ? 'ok' : 'warn');
+  } catch (e) { toast(T('import.failed'), 'bad', e.message); return; }
   renderProviders(); renderGatewayInfo();
 }
 
@@ -3737,7 +3777,7 @@ function openKeyInTester(pid, kid) {
   document.getElementById('provider_id').value = p.name;
   document.getElementById('savedProfiles').value = '';
   showTab('test');
-  setStatus('المفتاح جاي من المزود وكيبقى فالسيرفر. ضغط "شغّل الاختبار".');
+  setStatus(T('tester.from_provider'));
 }
 function clearTesterKeyRef() {
   if (!testerKeyRef) return;
@@ -3758,16 +3798,16 @@ function renderGatewayInfo() {
   document.getElementById('gwModelCount').textContent = gwState.models.length;
   document.getElementById('gwModels').innerHTML = gwState.models.length
     ? gwState.models.map(m => `<span class="model-tag">${escapeHtml(m)}</span>`).join('')
-    : '<span class="modal-desc" style="margin:0;">ما كاين حتى موديل. زيد مزود واختبر المفاتيح ديالو.</span>';
+    : `<span class="modal-desc" style="margin:0;">${T('gw.no_models')}</span>`;
 }
 function toggleLocalKey() { showLocalKey = !showLocalKey; renderGatewayInfo(); }
 async function regenerateLocalKey() {
-  if (!confirm('نولّد مفتاح محلي جديد؟ المفتاح القديم غادي يوقف، والوكلاء المفعلين غادي يتحدثو تلقائياً.')) return;
+  if (!confirm(T('gw.confirm_regen'))) return;
   try {
     const r = await api('/api/gateway/regenerate', {});
     gwState = r; renderGatewayInfo();
-    toast('تولد مفتاح جديد', 'ok', r.agents_updated.length ? 'تحدثو: ' + r.agents_updated.join(', ') : '');
-  } catch (e) { toast('خطأ', 'bad', e.message); }
+    toast(T('gw.regenerated'), 'ok', r.agents_updated.length ? T('gw.updated_agents', { list: r.agents_updated.join(', ') }) : '');
+  } catch (e) { toast(T('common.error'), 'bad', e.message); }
 }
 function setLogFilter(f) {
   logFilter = f;
@@ -3779,18 +3819,18 @@ async function loadLogs() {
   try { logs = (await api('/api/logs?limit=200')).logs; } catch (e) { return; }
   if (logFilter !== 'all') logs = logs.filter(l => l.status === logFilter);
   const body = document.getElementById('logsBody');
-  if (!logs.length) { body.innerHTML = '<tr class="empty-row"><td colspan="7">ما كاين حتى طلب بعد.</td></tr>'; return; }
+  if (!logs.length) { body.innerHTML = `<tr class="empty-row"><td colspan="7">${T('gw.no_requests')}</td></tr>`; return; }
   body.innerHTML = logs.map(l => {
     const t = new Date(l.time * 1000);
     const ok = l.status === 'ok';
     const tokens = (l.tokens_in != null || l.tokens_out != null) ? `${l.tokens_in ?? '?'} → ${l.tokens_out ?? '?'}` : '—';
-    const fo = l.failovers ? ` <span class="sub-metric">${l.failovers} تبديل</span>` : '';
+    const fo = l.failovers ? ` <span class="sub-metric">${T('log.failovers', { n: l.failovers })}</span>` : '';
     return `<tr>
       <td class="mono" style="font-size:11.5px;">${t.toLocaleTimeString()}</td>
       <td>${escapeHtml(l.client || '')}<span class="sub-metric">${escapeHtml(l.format || '')}${l.stream ? ' · stream' : ''}</span></td>
       <td class="mono">${escapeHtml(l.model || '')}</td>
       <td>${escapeHtml(l.provider || '—')}<span class="sub-metric" dir="ltr">${escapeHtml(l.key || '')}</span>${fo}</td>
-      <td><span class="pill ${ok ? 'ok' : 'bad'}">${ok ? 'نجح' : 'خطأ'} ${l.code || ''}</span>${l.error ? `<span class="sub-metric" style="white-space:normal; max-width:320px;" title="${escapeHtml(l.error)}">${escapeHtml(l.error.slice(0, 90))}</span>` : ''}</td>
+      <td><span class="pill ${ok ? 'ok' : 'bad'}">${ok ? T('log.ok') : T('common.error')} ${l.code || ''}</span>${l.error ? `<span class="sub-metric" style="white-space:normal; max-width:320px;" title="${escapeHtml(l.error)}">${escapeHtml(l.error.slice(0, 90))}</span>` : ''}</td>
       <td class="mono">${tokens}</td>
       <td class="mono">${l.ms != null ? (l.ms / 1000).toFixed(2) + 's' : '—'}</td>
     </tr>`;
@@ -3836,7 +3876,7 @@ function renderAlertHistory() {
     </div>`).join('') + (list.length > 100 ? `<div class="ah-more">+${list.length - 100} قدام</div>` : '');
 }
 async function clearGatewayLogs() {
-  if (!confirm('تمسح السجل كامل؟')) return;
+  if (!confirm(T('gw.confirm_clear'))) return;
   await api('/api/logs/clear', {}); loadLogs();
 }
 
@@ -3846,7 +3886,7 @@ let agentsCache = [];
 let iconTarget = null;
 async function loadAgents() {
   let r;
-  try { r = await api('/api/agents'); } catch (e) { toast('ما قدرتش نقرا الوكلاء', 'bad', e.message); return; }
+  try { r = await api('/api/agents'); } catch (e) { toast(T('agents.load_failed'), 'bad', e.message); return; }
   reasoningModels = new Set(r.reasoning_models || []);
   renderAgents(r.agents, r.models);
 }
@@ -3868,27 +3908,27 @@ function renderAgents(list, models) {
     const filtered = shown.length < models.length;
     const want = agentPick[a.id] || a.model;
     const cur = shown.includes(want) ? want : (shown[0] || '');
-    const pill = !a.installed ? '<span class="pill bad">ما مثبتش</span>'
-      : a.enabled ? '<span class="pill ok">مفعّل على الـ gateway</span>' : '<span class="pill pending">الإعدادات الأصلية</span>';
+    const pill = !a.installed ? `<span class="pill bad">${T('agents.not_installed')}</span>`
+      : a.enabled ? `<span class="pill ok">${T('agents.enabled')}</span>` : `<span class="pill pending">${T('agents.original')}</span>`;
     const warn = a.id === 'claude'
-      ? `<div class="modal-desc" style="margin:0;">${a.enabled ? '' : 'ملي يتفعل، جلسات Claude Code الجديدة فالتيرمينال (<code>claude</code>) غادي تدوز من الـ gateway بدل حسابك. '}تطبيق Claude ديال الديسكتوب كيبعث الحساب ديالو بيدو، داكشي علاش ما كيتبدلش. خلي هاد البرنامج شاعل، وفـ Claude Code كتب <code>/status</code>: خاص يبان Anthropic base URL: 127.0.0.1.</div>` : '';
+      ? `<div class="modal-desc" style="margin:0;">${a.enabled ? '' : T('agents.claude_new')}${T('agents.claude_note')}</div>` : '';
     let custom = '';
     if (a.spec) {
       const f = a.spec.fields, cur = a.current || {};
       const row = (label, field, key) => field
-        ? `<span class="fk">${label}</span><span class="fv">${escapeHtml(field)} = ${cur[key] == null ? '<i>(ما كاينش)</i>' : escapeHtml(cur[key])}</span>` : '';
+        ? `<span class="fk">${label}</span><span class="fv">${escapeHtml(field)} = ${cur[key] == null ? `<i>${T('agents.field_missing')}</i>` : escapeHtml(cur[key])}</span>` : '';
       custom = `<div class="fields" dir="ltr">${row('URL', f.base_url, 'base_url')}${row('Key', f.api_key, 'api_key')}${row('Model', f.model, 'model')}</div>`;
     }
     const acts = a.builtin ? '' : `<span class="card-acts">
-        <button title="تعديل" onclick="openAgentForm('${esc(a.id)}')">✏️</button>
-        <button title="حذف" onclick="deleteCustomAgent('${esc(a.id)}')">🗑</button></span>`;
+        <button title="${escapeHtml(T('common.edit'))}" onclick="openAgentForm('${esc(a.id)}')">✏️</button>
+        <button title="${escapeHtml(T('common.delete'))}" onclick="deleteCustomAgent('${esc(a.id)}')">🗑</button></span>`;
     return `<div class="agent-card ${a.enabled ? 'on' : ''}">
       <div class="top">
-        <button class="agent-ic" title="بدل الصورة" onclick="openIconMenu(event, '${esc(a.id)}')">${agentIconHtml(a)}</button>
+        <button class="agent-ic" title="${escapeHtml(T('agents.change_icon'))}" onclick="openIconMenu(event, '${esc(a.id)}')">${agentIconHtml(a)}</button>
         <div style="min-width:0;"><div class="nm">${escapeHtml(a.name)}</div>
           <div class="ver">${a.spec ? `<span class="kind">${a.spec.kind === 'env' ? '.env' : 'JSON'} · ${a.spec.format === 'anthropic' ? 'Anthropic' : 'OpenAI'}</span>` : escapeHtml(a.version || '')}</div></div>
         ${pill}${acts}</div>
-      <div class="meta" dir="ltr">${escapeHtml(a.config_path)}${a.config_exists ? '' : ' (غادي يتخلق)'}</div>
+      <div class="meta" dir="ltr">${escapeHtml(a.config_path)}${a.config_exists ? '' : ' ' + T('agents.will_create')}</div>
       ${custom}
       ${a.enabled && a.backup ? `<div class="meta" dir="ltr">backup: ${escapeHtml(a.backup)}</div>` : ''}
       ${a.note ? `<div class="note">⚠️ ${escapeHtml(a.note)}</div>` : ''}
@@ -3897,25 +3937,25 @@ function renderAgents(list, models) {
         <div class="mdd" id="mdd-${a.id}">
           <input type="hidden" id="agentModel-${a.id}" value="${escapeHtml(cur)}">
           <button type="button" class="mdd-field" ${a.installed && models.length ? '' : 'disabled'} onclick="toggleModelDropdown('${esc(a.id)}')">
-            <span class="mdd-val" dir="ltr" id="mddVal-${a.id}">${models.length ? escapeHtml(cur) : 'ما كاين حتى موديل'}</span>
+            <span class="mdd-val" dir="ltr" id="mddVal-${a.id}">${models.length ? escapeHtml(cur) : T('agents.no_models')}</span>
             ${filtered ? `<span class="mdd-badge">☑ ${shown.length}</span>` : ''}
             <svg class="mdd-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l4 4 4-4"/></svg>
           </button>
           <div class="mdd-panel">
-            <input class="mdd-search" id="mddSearch-${a.id}" dir="auto" placeholder="🔍 قلب على موديل..." autocomplete="off"
+            <input class="mdd-search" id="mddSearch-${a.id}" dir="auto" placeholder="${escapeHtml(T('agents.search_ph'))}" autocomplete="off"
               oninput="renderModelDropdown()" onkeydown="modelDropdownKey(event)">
             <div class="mdd-list" id="mddList-${a.id}"></div>
             <div class="mdd-foot"><span class="mdd-count" id="mddCount-${a.id}"></span>
-              <button type="button" onclick="markShownModels(true)" title="علّم كاع الموديلات لي ظاهرين فالبحث">☑ الظاهرين</button>
-              <button type="button" onclick="markShownModels(false)" title="حيد العلامة من الموديلات لي ظاهرين">☐ حيد</button></div>
+              <button type="button" onclick="markShownModels(true)" title="${escapeHtml(T('agents.mark_shown_title'))}">${T('agents.mark_shown')}</button>
+              <button type="button" onclick="markShownModels(false)" title="${escapeHtml(T('agents.unmark_title'))}">${T('agents.unmark')}</button></div>
           </div>
         </div>
         <div id="effortRow-${a.id}">${effortSelectHtml(a.id, cur, a.installed && models.length)}</div>
-        ${filtered ? `<div class="agent-filter-info">☑ كيبانو غير ${shown.length} من ${models.length} موديل فهاد الوكيل</div>` : ''}
+        ${filtered ? `<div class="agent-filter-info">${T('agents.filter_info', { shown: shown.length, total: models.length })}</div>` : ''}
       </div>
       <div class="row">
-        <button class="primary" ${a.installed && models.length ? '' : 'disabled'} onclick="enableAgent('${esc(a.id)}')">${a.enabled ? '🔁 تحديث' : '⚡ تفعيل'}</button>
-        <button class="ghost" ${a.enabled ? '' : 'disabled'} onclick="disableAgent('${esc(a.id)}')">↩️ إيقاف ورجوع للأصل</button>
+        <button class="primary" ${a.installed && models.length ? '' : 'disabled'} onclick="enableAgent('${esc(a.id)}')">${a.enabled ? T('agents.update') : T('agents.enable')}</button>
+        <button class="ghost" ${a.enabled ? '' : 'disabled'} onclick="disableAgent('${esc(a.id)}')">${T('agents.disable')}</button>
       </div>
     </div>`;
   }).join('');
@@ -3979,16 +4019,16 @@ function renderModelDropdown() {
   document.getElementById('mddList-' + mdd.id).innerHTML = mddHits().map(m => {
     const i = agentModelsAll.indexOf(m);
     return `<div class="mdd-row ${m === cur ? 'sel' : ''}" onclick="chooseDropdownModel(${i})">
-      <input type="checkbox" title="يبان فهاد الوكيل" ${mdd.marked.has(m) ? 'checked' : ''}
+      <input type="checkbox" title="${escapeHtml(T('agents.show_in_agent'))}" ${mdd.marked.has(m) ? 'checked' : ''}
         onclick="event.stopPropagation()" onchange="markDropdownModel(${i}, this.checked)">
       <span class="mdd-name" dir="ltr">${escapeHtml(m)}</span></div>`;
-  }).join('') || '<div class="mdd-empty">ما لقيت حتى موديل</div>';
+  }).join('') || `<div class="mdd-empty">${T('agents.none_found')}</div>`;
   updateDropdownCount();
 }
 function updateDropdownCount() {
   const n = mdd.marked.size;
   document.getElementById('mddCount-' + mdd.id).textContent = n
-    ? `☑ ${n} من ${agentModelsAll.length} كيبانو فالوكيل` : `☐ ما معلّم والو = كيبانو كاملين`;
+    ? T('agents.count_marked', { n, total: agentModelsAll.length }) : T('agents.count_none');
 }
 function setDropdownValue(m) {
   document.getElementById('agentModel-' + mdd.id).value = m;
@@ -4040,9 +4080,9 @@ async function closeModelDropdown() {
       effort: effortValue(id) });
     renderAgents(r.agents, agentModelsAll);
     const a = r.agents.find(x => x.id === id);
-    toast(models.length ? `☑ كيبانو ${models.length} موديل فـ ${a ? a.name : 'الوكيل'}` : 'رجعو يبانو جميع الموديلات', 'ok',
-      a && a.enabled ? 'الوكيل تحدث، عاود شغلو باش ياخد الإعدادات.' : '');
-  } catch (e) { toast('ما تحفظش', 'bad', e.message); }
+    toast(models.length ? T('agents.marked_toast', { n: models.length, name: a ? a.name : T('agents.the_agent') }) : T('agents.all_shown'), 'ok',
+      a && a.enabled ? T('agents.restart_hint') : '');
+  } catch (e) { toast(T('common.not_saved'), 'bad', e.message); }
 }
 document.addEventListener('mousedown', e => {
   if (mdd && !e.target.closest('#mdd-' + CSS.escape(mdd.id))) closeModelDropdown();
@@ -4053,15 +4093,15 @@ async function enableAgent(id) {
   try {
     const r = await api('/api/agents/enable', { agent: id, model, effort: effortValue(id) });
     renderAgents(r.agents, gwState ? gwState.models : []);
-    toast('تفعّل. عاود شغّل الوكيل باش ياخد الإعدادات.', 'ok');
-  } catch (e) { toast('ما تفعّلش', 'bad', e.message); }
+    toast(T('agents.enabled_toast'), 'ok');
+  } catch (e) { toast(T('agents.enable_failed'), 'bad', e.message); }
   loadAgents();
 }
 async function disableAgent(id) {
   try {
     const r = await api('/api/agents/disable', { agent: id });
-    toast(r.restored === 'exact' ? 'رجعت الإعدادات الأصلية كما كانت بالضبط.' : 'رجعو القيم الأصلية (الملف تبدل من برا، التعديلات الأخرى بقات).', 'ok');
-  } catch (e) { toast('خطأ', 'bad', e.message); }
+    toast(r.restored === 'exact' ? T('agents.restored_exact') : T('agents.restored_values'), 'ok');
+  } catch (e) { toast(T('common.error'), 'bad', e.message); }
   loadAgents();
 }
 
@@ -4077,7 +4117,7 @@ function openAgentForm(id) {
   document.getElementById('ag_f_base').value = s ? s.fields.base_url : '';
   document.getElementById('ag_f_key').value = s ? s.fields.api_key : '';
   document.getElementById('ag_f_model').value = s ? (s.fields.model || '') : '';
-  document.getElementById('agentFormTitle').textContent = s ? '✏️ تعديل ' + s.name : '🤖 زيد وكيل';
+  document.getElementById('agentFormTitle').textContent = s ? T('common.edit_title', { name: s.name }) : T('agents.form_add');
   updateAgentFormHints();
   document.getElementById('agentOverlay').classList.add('open');
   document.getElementById('ag_name').focus();
@@ -4096,7 +4136,7 @@ function updateAgentFormHints() {
   const k = document.getElementById('ag_f_key').value || document.getElementById('ag_f_key').placeholder;
   const m = document.getElementById('ag_f_model').value;
   document.getElementById('agentPreview').textContent =
-    `"تفعيل" غادي يكتب:\n  ${b} = ${url}\n  ${k} = sk-local-…` + (m ? `\n  ${m} = <الموديل لي تختار>` : '');
+    `${T('agents.preview')}\n  ${b} = ${url}\n  ${k} = sk-local-…` + (m ? `\n  ${m} = ${T('agents.preview_model')}` : '');
 }
 ['ag_f_base', 'ag_f_key', 'ag_f_model'].forEach(id => document.addEventListener('input', e => { if (e.target.id === id) updateAgentFormHints(); }));
 async function saveAgentForm() {
@@ -4113,16 +4153,16 @@ async function saveAgentForm() {
     const r = await api('/api/agents/custom/save', body);
     renderAgents(r.agents, gwState ? gwState.models : []);
     closeAgentForm();
-    toast(`تحفظ الوكيل "${body.name}"`, 'ok');
-  } catch (e) { toast('ما تحفظش', 'bad', e.message); }
+    toast(T('agents.saved', { name: body.name }), 'ok');
+  } catch (e) { toast(T('common.not_saved'), 'bad', e.message); }
 }
 async function deleteCustomAgent(id) {
   const a = agentsCache.find(x => x.id === id);
-  if (!confirm(`تحذف الوكيل "${a ? a.name : ''}" من اللائحة؟ (الملف ديالو ما كيتمسش)`)) return;
+  if (!confirm(T('agents.confirm_delete', { name: a ? a.name : '' }))) return;
   try {
     const r = await api('/api/agents/custom/delete', { agent: id });
     renderAgents(r.agents, gwState ? gwState.models : []);
-  } catch (e) { toast('ما تحذفش', 'bad', e.message); }
+  } catch (e) { toast(T('agents.delete_failed'), 'bad', e.message); }
 }
 
 /* ---- agent icons ---- */
@@ -4136,7 +4176,7 @@ function openIconMenu(e, id) {
   menu.classList.add('open');
   const w = menu.offsetWidth;
   menu.style.top = Math.min(window.innerHeight - menu.offsetHeight - 8, r.bottom + 6) + 'px';
-  menu.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) + 'px';
+  menu.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, RTL ? r.right - w : r.left)) + 'px';
 }
 document.addEventListener('click', () => document.getElementById('iconMenu')?.classList.remove('open'));
 function pickIconFile() { document.getElementById('iconFile').click(); }
@@ -4149,7 +4189,7 @@ function iconFileChosen(input) {
   const file = input.files && input.files[0];
   input.value = '';
   if (!file || !iconTarget) return;
-  if (!file.type.startsWith('image/')) { toast('اختار صورة', 'warn'); return; }
+  if (!file.type.startsWith('image/')) { toast(T('icon.pick_image'), 'warn'); return; }
   const img = new Image();
   img.onload = () => {
     // Center-crop to a square and shrink to 96x96 so it stays small on disk.
@@ -4158,11 +4198,11 @@ function iconFileChosen(input) {
     URL.revokeObjectURL(img.src);
     saveIcon(iconTarget, data);
   };
-  img.onerror = () => toast('ما قدرتش نقرا هاد الصورة', 'bad');
+  img.onerror = () => toast(T('icon.read_failed'), 'bad');
   img.src = URL.createObjectURL(file);
 }
 function pickIconEmoji() {
-  const em = prompt('كتب إيموجي واحد:', '🤖');
+  const em = prompt(T('icon.emoji_prompt'), '🤖');
   if (!em || !iconTarget) return;
   const data = renderIconToDataUrl(ctx => {
     ctx.font = '72px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
@@ -4176,8 +4216,8 @@ async function saveIcon(id, image) {
   try {
     const r = await api('/api/agents/icon', { agent: id, image });
     renderAgents(r.agents, gwState ? gwState.models : []);
-    toast(image ? 'تبدلات الصورة' : 'رجعات الصورة الأصلية', 'ok');
-  } catch (e) { toast('ما تبدلاتش الصورة', 'bad', e.message); }
+    toast(image ? T('icon.changed') : T('icon.restored'), 'ok');
+  } catch (e) { toast(T('icon.failed'), 'bad', e.message); }
 }
 
 function onTabShown(name) {
@@ -4191,7 +4231,7 @@ function onTabShown(name) {
    INIT
    ========================================================================= */
 document.addEventListener('DOMContentLoaded', async () => {
-  applyTheme(); applyToastUI(); initNav(); syncPhone();
+  applyTheme(); applyToastUI(); initNav(); syncLangUI(); syncPhone();
   await initServerStore();
   refreshProfileSelect();
   updateKeyStats();
@@ -4335,7 +4375,7 @@ class Handler(BaseHTTPRequestHandler):
         if gateway.is_gateway_path(path):
             return gateway.handle(self, "GET")
         if path in ("/", "/index.html"):
-            body = INDEX_HTML.encode("utf-8")
+            body = render_index(i18n.get_lang())
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -4380,10 +4420,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "Invalid JSON body"})
         if path == "/api/run":
             return self._run_tester(params)
+        if path == "/api/settings":
+            try:
+                i18n.set_lang(params.get("lang"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, {"ok": True, "lang": i18n.get_lang()})
         if path.startswith("/api/store/"):
             # Whole-list writes come from a page opened before this version; they would undo other tabs' changes.
             if "ops" not in params:
-                return self._json(409, {"error": "الصفحة قديمة، دير F5 باش تحفظ."})
+                return self._json(409, {"error": i18n.t("srv.page_old")})
             try:
                 value = ui_store_apply(path.rsplit("/", 1)[1], params.get("ops"))
             except ValueError as e:
@@ -4452,7 +4498,7 @@ class Handler(BaseHTTPRequestHandler):
             agents.set_icon(p.get("agent"), p.get("image") or "")
             return {"agents": agents.list_agents(root)}
         else:
-            raise ValueError("Unknown action.")
+            raise ValueError(i18n.t("srv.unknown_action"))
         return self._state()
 
     def _run_tester(self, params):
@@ -4460,7 +4506,7 @@ class Handler(BaseHTTPRequestHandler):
         if params.get("key_ref"):
             base, key = gateway.resolve_key_ref(params["key_ref"])
             if not key:
-                return self._json(400, {"error": "Stored key not found."})
+                return self._json(400, {"error": i18n.t("srv.stored_key_missing")})
             params["api_key"] = key
             params["base_url"] = params.get("base_url") or base
 
@@ -4484,11 +4530,32 @@ class Handler(BaseHTTPRequestHandler):
             pass  # المستخدم سد الصفحة قبل ما يسالي الاختبار
         except Exception as e:
             try:
-                emit("error", {"message": f"خطأ غير متوقع فالسيرفر: {e}"})
+                emit("error", {"message": i18n.t("srv.unexpected", error=e)})
             except StopStreaming:
                 pass
 
         self.close_connection = True
+
+
+# The page in one language: {{t:key}} -> escaped text, {{h:key}} -> trusted HTML from the
+# translation file, {{i18n:lang|dir|json}} -> <html> attributes and the dictionary for the JS T().
+_pages = {}
+
+
+def render_index(lang):
+    if lang not in _pages:
+        words = {**i18n.load(i18n.DEFAULT_LANG), **i18n.load(lang)}
+        extra = {"lang": lang, "dir": i18n.direction(lang),
+                 "json": json.dumps(words, ensure_ascii=False).replace("</", "<\\/")}
+
+        def sub(m):
+            kind, key = m.groups()
+            if kind == "i18n":
+                return extra[key]
+            text = i18n.t(key, lang)
+            return text if kind == "h" else html.escape(text)
+        _pages[lang] = re.sub(r"\{\{(t|h|i18n):([\w.]+)\}\}", sub, INDEX_HTML).encode("utf-8")
+    return _pages[lang]
 
 
 # Saved keys ("مفاتيحي") and custom formats, kept next to the gateway data with
@@ -4591,14 +4658,14 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     alerts.start()
     url = f"http://{args.host}:{args.port}"
-    print(f"EskaGate شغال على: {url}")
-    print("Ctrl+C باش توقفو.")
+    print(i18n.t("cli.running", url=url))
+    print(i18n.t("cli.stop_hint"))
     if args.open:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nتوقف.")
+        print("\n" + i18n.t("cli.stopped"))
         server.shutdown()
 
 

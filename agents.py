@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import gateway
+import i18n
 
 STATE_FILE = gateway.DATA_DIR / "agents.json"
 MODEL_FILTER_FILE = gateway.DATA_DIR / "agent-models.json"   # {agent_id: [models shown to that agent]}
@@ -185,7 +186,7 @@ class JsonAgent:
         state = _load_state()
         info = state.get(self.id)
         if not info or not info.get("enabled"):
-            raise ValueError("This agent was not enabled by the gateway.")
+            raise ValueError(i18n.t("err.not_enabled_by_gw"))
         path = Path(info["path"])
         if _sha(path) == info.get("written_hash"):
             # Untouched since we wrote it: put the original file back exactly.
@@ -223,9 +224,9 @@ class JsonAgent:
             except Exception:
                 ours = False
             if not ours:
-                out["note"] = "Config was changed outside the gateway since it was enabled."
+                out["note"] = i18n.t("note.changed_outside")
             elif info.get("base_url") != base_url:
-                out["note"] = "Enabled with a different port; press Enable again."
+                out["note"] = i18n.t("note.other_port")
         return out
 
 
@@ -374,11 +375,11 @@ class Hermes:
     def _cli(self, *args):
         binary = shutil.which(self.binary)
         if not binary:
-            raise ValueError("The hermes command was not found.")
+            raise ValueError(i18n.t("err.hermes_missing"))
         res = subprocess.run([binary, "config", *args], capture_output=True, text=True, timeout=60,
                              env=os.environ.copy())
         if res.returncode != 0:
-            raise ValueError(f"hermes config {args[0]} failed: {(res.stderr or res.stdout).strip()[:200]}")
+            raise ValueError(i18n.t("err.hermes_failed", cmd=args[0], error=(res.stderr or res.stdout).strip()[:200]))
 
     def enable(self, base_url, local_key, model, models):
         path = self.config_path()
@@ -402,7 +403,7 @@ class Hermes:
         state = _load_state()
         info = state.get(self.id)
         if not info or not info.get("enabled"):
-            raise ValueError("This agent was not enabled by the gateway.")
+            raise ValueError(i18n.t("err.not_enabled_by_gw"))
         path = Path(info["path"])
         if _sha(path) == info.get("written_hash") and info.get("backup") and Path(info["backup"]).exists():
             text = Path(info["backup"]).read_text(encoding="utf-8")
@@ -432,9 +433,9 @@ class Hermes:
         if out["enabled"]:
             block = self.read_model_block(path.read_text(encoding="utf-8")) if path.exists() else {}
             if block.get("base_url") != base_url + "/v1":
-                out["note"] = "Config was changed outside the gateway since it was enabled."
+                out["note"] = i18n.t("note.changed_outside")
             elif info.get("base_url") != base_url:
-                out["note"] = "Enabled with a different port; press Enable again."
+                out["note"] = i18n.t("note.other_port")
         return out
 
 
@@ -570,7 +571,7 @@ class CustomEnvAgent:
         state = _load_state()
         info = state.get(self.id)
         if not info or not info.get("enabled"):
-            raise ValueError("This agent was not enabled by the gateway.")
+            raise ValueError(i18n.t("err.not_enabled_by_gw"))
         path = Path(info["path"])
         if _sha(path) == info.get("written_hash"):
             if info.get("backup") and Path(info["backup"]).exists():
@@ -607,7 +608,7 @@ class CustomEnvAgent:
         if out["enabled"]:
             cur = self._parse(path.read_text(encoding="utf-8")) if path.exists() else {}
             if cur.get(self.spec["fields"]["base_url"]) != _gateway_url(base_url, self.spec["format"]):
-                out["note"] = "Config was changed outside the gateway since it was enabled."
+                out["note"] = i18n.t("note.changed_outside")
         return out
 
 
@@ -642,7 +643,7 @@ def set_model_filter(agent_id, models, base_url, model=None, effort=None):
     An enabled agent is rewritten right away (with `model` as its model, when given)
     so its config lists only those models."""
     if agent_id not in all_agents():
-        raise ValueError("Unknown agent.")
+        raise ValueError(i18n.t("err.unknown_agent"))
     clean = list(dict.fromkeys(m.strip() for m in (models or []) if isinstance(m, str) and m.strip()))
     filters = _load_model_filters()
     if clean:
@@ -686,14 +687,14 @@ def enable(agent_id, base_url, model, effort=None):
     None keeps the level already in `model` ("gpt-5@high"), as saved by an earlier enable."""
     agent = all_agents().get(agent_id)
     if not agent:
-        raise ValueError("Unknown agent.")
+        raise ValueError(i18n.t("err.unknown_agent"))
     model, saved = gateway.split_effort(model)
     effort = saved if effort is None else (effort or "")
     if effort and effort not in gateway.EFFORTS:
         raise ValueError("Unknown thinking level.")
     models = visible_models(agent_id)
     if not model:
-        raise ValueError("Pick a model first (add a provider and test its keys to get models).")
+        raise ValueError(i18n.t("err.pick_model"))
     if model not in models:
         if _load_model_filters().get(agent_id) and models:
             model = models[0]          # only the marked models, even if that's just one
@@ -717,7 +718,7 @@ gateway.EXTRA_MODELS = _effort_models
 def disable(agent_id):
     agent = all_agents().get(agent_id)
     if not agent:
-        raise ValueError("Unknown agent.")
+        raise ValueError(i18n.t("err.unknown_agent"))
     return agent.disable()
 
 
@@ -743,25 +744,25 @@ def save_custom(spec_in):
     path = (spec_in.get("path") or "").strip()
     fields = {k: (spec_in.get("fields", {}).get(k) or "").strip() for k in ("base_url", "api_key", "model")}
     if not name:
-        raise ValueError("Give the agent a name.")
+        raise ValueError(i18n.t("err.agent_name"))
     if not path or not os.path.isabs(os.path.expanduser(path)):
-        raise ValueError("The config path must be a full path (it can start with ~).")
+        raise ValueError(i18n.t("err.agent_path"))
     if Path(os.path.expanduser(path)).is_dir():
-        raise ValueError("The config path points to a folder; give the file itself.")
+        raise ValueError(i18n.t("err.agent_path_dir"))
     if not fields["base_url"] or not fields["api_key"]:
-        raise ValueError("The URL field and the key field are required.")
+        raise ValueError(i18n.t("err.agent_fields"))
     check = ENV_RE if kind == "env" else FIELD_RE
     for k, v in fields.items():
         if v and not check.match(v):
-            raise ValueError(f"Field '{v}' is not valid for a {'.env variable' if kind == 'env' else 'JSON path (a.b.c)'}.")
+            raise ValueError(i18n.t("err.agent_field_env" if kind == "env" else "err.agent_field_json", field=v))
     data = _load_custom()
     state = _load_state()
     existing = next((a for a in data["agents"] if a["id"] == spec_in.get("id")), None)
     if existing and state.get(existing["id"], {}).get("enabled"):
-        raise ValueError("Disable this agent before editing it.")
+        raise ValueError(i18n.t("err.agent_disable_edit"))
     if any(a["name"].lower() == name.lower() and a["id"] != spec_in.get("id") for a in data["agents"]) \
             or name.lower() in (a.name.lower() for a in BUILTIN.values()):
-        raise ValueError(f"An agent named '{name}' already exists.")
+        raise ValueError(i18n.t("err.agent_exists", name=name))
     spec = {"id": existing["id"] if existing else gateway.new_id("custom_"), "name": name, "kind": kind,
             "format": fmt, "path": path, "fields": fields}
     if existing:
@@ -774,7 +775,7 @@ def save_custom(spec_in):
 
 def delete_custom(agent_id):
     if _load_state().get(agent_id, {}).get("enabled"):
-        raise ValueError("Disable this agent first, so its config goes back to the original.")
+        raise ValueError(i18n.t("err.agent_disable_delete"))
     data = _load_custom()
     data["agents"] = [a for a in data["agents"] if a["id"] != agent_id]
     data["icons"].pop(agent_id, None)
@@ -784,14 +785,14 @@ def delete_custom(agent_id):
 def set_icon(agent_id, image):
     """image: a data:image/... URL, or empty to go back to the default icon."""
     if agent_id not in all_agents():
-        raise ValueError("Unknown agent.")
+        raise ValueError(i18n.t("err.unknown_agent"))
     data = _load_custom()
     if not image:
         data["icons"].pop(agent_id, None)
     else:
         if not re.match(r"^data:image/(png|jpeg|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$", image):
-            raise ValueError("Unsupported image.")
+            raise ValueError(i18n.t("err.image_type"))
         if len(image) > ICON_MAX:
-            raise ValueError("Image is too large.")
+            raise ValueError(i18n.t("err.image_size"))
         data["icons"][agent_id] = image
     _save_custom(data)
