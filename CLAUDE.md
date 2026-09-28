@@ -17,6 +17,9 @@ The user writes in Moroccan Darija or Arabic. Reply in the language they use. Th
 | `i18n.py`, `i18n/` | Translations: `ar.json`, `en.json`, `fr.json` (flat, same keys, `{name}` placeholders), `t()` helper, saved language, and a CLI (`python3 i18n.py <key> [name=value] [lang=xx]`) used by the shell scripts. |
 | `tests/test_i18n.py` | `python3 -m unittest discover tests`: same keys in all files, same placeholders, every used key exists, no unused keys, each language renders with the right `dir`, no Arabic left in the en/fr page, `node --check` on the scripts. |
 | `agents.py` | Agent config switching (enable/disable with backup and restore), custom agents, per-agent model filter, icons. |
+| `alerts.py` | Telegram alerts. Sets `gateway.ON_EVENT` (gateway never imports it); events `key_failed`, `provider_down`, `key_ok`, `quota_low`, `request` (start/end, for the idle check), `request_logged` (from `add_log`, for the daily summary counters). Dedup per (provider or `agent:<name>`, cause) for `DEDUP` = 300 s. Threads: sender (logs every alert to the history), ticker every 10 s (`check_idle`, `check_summary`, stats save), command poller (`getUpdates` long polling; `handle_command` for /status, /switch; only the saved chat). While the poller runs, "🔎 جيبو" (`tg.find`) uses the chat it saw, since Telegram allows one update reader. `ESKAGATE_TELEGRAM_API` overrides the API base for tests. |
+| `phone.py` | Phone access: a second `ThreadingHTTPServer` on the private LAN IP (same port, `server.lan = True`), started/stopped from the page. Token in memory, rotated on stop; off after every restart. |
+| `qr.py` | Stdlib QR encoder (byte mode, level M, versions 1-10) returning SVG. Verified with a zxing decoder over all masks and versions. |
 | `eskali_api_launcher.sh` | `start` (background + opens browser) / `stop`. PID in `~/.api-test-console/eskali_api.pid`, log in `eskali_api.log`. Port from `ESKALI_API_PORT` (default 8000). |
 | `install_eskali_api.sh` | Installs the apps-menu `.desktop` entry, icon and desktop shortcut (generated, not stored in the repo). `--uninstall` removes them. |
 | `run-api-dashboard.sh`, `Run API Dashboard.bat`, `create_shortcut.vbs` | Foreground run on Linux / Windows. |
@@ -44,11 +47,16 @@ Everything lives in `~/.api-test-console/` (override with `API_CONSOLE_HOME`): t
 | `agents-custom.json` | Custom agent specs and icons |
 | `agent-models.json` | Per-agent model filter |
 | `agent-backups/` | Copies of agent configs taken before Enable |
+| `telegram.json` | Telegram bot token, chat ID, enabled, idle minutes, summary on/off and time (token/chat shown masked in the page) |
+| `alert-stats.json` | Per-agent counters since the last daily summary, last summary date, quota warnings sent per key per day |
+| `alert-history.jsonl` | Every alert sent: time, provider, agent, type, message, sent (capped around 5000 lines) |
 
 Tabs save profiles/formats as per-entry ops (`POST /api/store/<name>` with `{ops}`: create / set+unset / delete, keyed by `name`), applied under a lock by `ui_store_apply()`, so a stale tab can't revive a deleted key or drop a new one. Whole-list `{value}` writes (pages from before this) get 409. localStorage is only a read fallback when the server is unreachable; it is never merged back.
 
 ## Server and API
 
+- Phone access (LAN listener): every request, including `/v1/*`, first passes `Handler._lan_gate()`. `?token=` on a GET sets the `eg_phone` cookie (HttpOnly, SameSite=Lax) and redirects without it. No valid token gives 401, and a non-private client IP gives 403. On that listener `_admin_ok()` accepts only the LAN IP as Host/Origin. Routes: `GET /api/phone`, `POST /api/phone/{start,stop}`; Telegram: `GET /api/telegram`, `POST /api/telegram/{save,test,chat-id}`, `GET /api/alerts/history`.
+- Quota: `gateway.parse_quota()` reads rate-limit headers (success and error responses) into `key["quota"] = {at, buckets: {requests|tokens|requests_day|tokens_day: {limit, remaining, reset}}}`. It is shown per key in the Providers tab (`quotaHtml()`), and "ما مصرحش" (`quota.not_reported`) when absent. Never estimated, never fetched from another endpoint. `gateway.switch_active_key()` and `provider_status_lines()` back the bot commands.
 - Page API: `/api/*`. Requests must carry the header `X-Console: 1`, and a non-localhost `Origin` is rejected with 403. A plain `curl` gets `{"error":"Forbidden"}`, which is expected and not a bug. To inspect state from the shell, import the modules directly, e.g. `python3 -c "import agents; print(agents.list_agents('http://127.0.0.1:8000'))"`.
 - Routes: `/api/run` (NDJSON stream), `/api/settings` (`{lang}`), `/api/store/{profiles,formats}`, `/api/providers/{save,delete,import,test,keys/add,keys/check,keys/delete}`, `/api/gateway/{state,regenerate}`, `/api/logs[/clear]`, `/api/agents[/enable,/disable,/models,/custom/save,/custom/delete,/icon]`.
 - Gateway endpoints on the same port: `POST /v1/chat/completions` (OpenAI), `POST /v1/messages` (+ `/count_tokens`, Anthropic), `GET /v1/models`. OpenAI clients use `http://127.0.0.1:8000/v1`; Anthropic clients use the bare root.
@@ -72,7 +80,8 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
 
 - `INDEX_HTML` holds keys, not text: `{{t:key}}` (HTML-escaped), `{{h:key}}` (trusted HTML from the file), `{{i18n:lang|dir|json}}`. `render_index(lang)` fills them per request from the saved language (cached per process, so edits to `i18n/*.json` also need a restart).
 - JS uses `T('key', {name: value})` (not `t`, which is a common local variable there). `T()` does not escape: escape user data before it goes into HTML, and wrap `T()` in `escapeHtml()` inside attributes. `LANG` and `RTL` are globals.
-- Python uses `i18n.t("key", name=...)` (server messages, `gateway.py`/`agents.py` errors shown in the page). Messages sent to agents through `/v1/*` stay English.
+- Python uses `i18n.t("key", name=...)` (server messages, `gateway.py`/`agents.py`/`phone.py` errors shown in the page). `key` and `lang` are positional-only, so they also work as placeholders (`{key}` is common in alerts). Messages sent to agents through `/v1/*` stay English.
+- Telegram (`alerts.py`): alerts, the daily summary, bot replies (`bot.*`) and settings errors use `i18n.t()` with the saved UI language, read when each message is built, so they follow a language switch at once. Keys `alert.*`, `tg.*`, `bot.*`, `quota.*`. `handle_command` maps `gateway.switch_active_key()` errors by comparing with `i18n.t("err.unknown_provider")` / `i18n.t("err.no_other_key")`. Quota bucket names come from `gateway.quota_label()`. The phone 401/403 page (`_deny`) uses the saved language and direction.
 - Shell: `t key name=value` in `eskali_api_launcher.sh` / `install_eskali_api.sh`; without Python it reads the JSON line with `sed`, so `launcher.*`/`install.*` values must not contain `"` or `\`.
 - Switching (header `<select id="langSelect">` or the Settings row) calls `setLang()`: POST `/api/settings`, flush unsaved store ops, reload.
 - Layout: use logical CSS (`margin-inline-start`, `inset-inline-end`, `border-inline-start`, `text-align: start`), never `left`/`right`, so both directions work. `--slide-x` flips the toast animation.
@@ -90,6 +99,9 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
   - A floating ⬆ button (`#toTop`) returns to the top.
 - **Key name link:** the card title links to the key's "المصدر" (source) field when it is an http(s) URL or a bare domain (`sourceUrl()`). It opens in a new tab and rejects other schemes.
 - **Copy config menu** on each key: opencode / pi agent (`piagent`) / hermes / custom formats / custom template.
+- **Thinking level per agent:** under the model picker, a 🧠 select (`effortSelectHtml()`) shows only for models that `gateway.supports_reasoning()` guesses from the name (sent to the page as `reasoning_models`). The level travels in the model name written to the agent config (`gpt-5@high`, levels in `gateway.EFFORTS`). `dispatch()` strips it for routing and `apply_effort()` writes the upstream parameter: `reasoning_effort` (OpenRouter: `reasoning.effort`), or for Anthropic `thinking` adaptive + `output_config.effort` (4.6+/5 family) or `budget_tokens` (older). A 400 that names the parameter is retried without it and remembered in `NO_EFFORT`. Anthropic thinking comes back to OpenAI clients as `reasoning_content`.
+
+- **Phone layout (≤520px):** compact header (title hidden ≤400px), 2-column stats, key/agent grids use `minmax(0, 1fr)`. Headless Chrome can't go below ~500px wide, so check phone widths through the DevTools protocol (`Emulation.setDeviceMetricsOverride`, driven from Node's built-in WebSocket) and make sure `document.documentElement.scrollWidth` equals the width.
 
 ## Working conventions (user preferences)
 

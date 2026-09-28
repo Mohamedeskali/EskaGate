@@ -638,7 +638,7 @@ def visible_models(agent_id, all_models=None):
     return [m for m in all_models if m in chosen] or all_models
 
 
-def set_model_filter(agent_id, models, base_url, model=None):
+def set_model_filter(agent_id, models, base_url, model=None, effort=None):
     """Save which models show up for an agent; an empty list means all of them.
     An enabled agent is rewritten right away (with `model` as its model, when given)
     so its config lists only those models."""
@@ -655,8 +655,9 @@ def set_model_filter(agent_id, models, base_url, model=None):
     info = _load_state().get(agent_id, {})
     if info.get("enabled"):
         shown = visible_models(agent_id)
-        model = next((m for m in (model, info.get("model")) if m and m in shown), shown[0] if shown else info.get("model"))
-        enable(agent_id, base_url, model)
+        old_model, old_effort = gateway.split_effort(info.get("model"))
+        model = next((m for m in (model, old_model) if m and m in shown), shown[0] if shown else old_model)
+        enable(agent_id, base_url, model, old_effort if effort is None else effort)
 
 
 def list_agents(base_url):
@@ -666,6 +667,7 @@ def list_agents(base_url):
     out = []
     for agent in all_agents().values():
         st = agent.status(base_url)
+        st["model"], st["effort"] = gateway.split_effort(st.get("model"))
         st["model_filter"] = filters.get(agent.id, [])
         st["builtin"] = agent.id in BUILTIN
         st["icon"] = custom["icons"].get(agent.id, "")
@@ -680,10 +682,16 @@ def list_agents(base_url):
     return out
 
 
-def enable(agent_id, base_url, model):
+def enable(agent_id, base_url, model, effort=None):
+    """`effort` is a thinking level from gateway.EFFORTS ("" = the agent's own default).
+    None keeps the level already in `model` ("gpt-5@high"), as saved by an earlier enable."""
     agent = all_agents().get(agent_id)
     if not agent:
         raise ValueError(i18n.t("err.unknown_agent"))
+    model, saved = gateway.split_effort(model)
+    effort = saved if effort is None else (effort or "")
+    if effort and effort not in gateway.EFFORTS:
+        raise ValueError(i18n.t("err.unknown_effort"))
     models = visible_models(agent_id)
     if not model:
         raise ValueError(i18n.t("err.pick_model"))
@@ -692,7 +700,19 @@ def enable(agent_id, base_url, model):
             model = models[0]          # only the marked models, even if that's just one
         else:
             models = [model] + models
-    agent.enable(base_url, gateway.store().local_key, model, models)
+    # The chosen model goes out as "model@level"; the gateway turns the suffix into the
+    # provider's own thinking parameter, so this works the same for every agent.
+    wire = gateway.with_effort(model, effort)
+    agent.enable(base_url, gateway.store().local_key, wire, [wire if m == model else m for m in models])
+
+
+def _effort_models():
+    """The "model@level" names enabled agents were given, so /v1/models lists them too."""
+    return [info["model"] for info in _load_state().values()
+            if info.get("enabled") and gateway.split_effort(info.get("model"))[1]]
+
+
+gateway.EXTRA_MODELS = _effort_models
 
 
 def disable(agent_id):

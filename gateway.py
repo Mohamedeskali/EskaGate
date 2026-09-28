@@ -15,6 +15,7 @@ Local AI Gateway — standard library only.
 
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -135,6 +136,7 @@ class Store:
                         "last_checked": k.get("last_checked"), "last_used": k.get("last_used"),
                         "cooldown_left": int(k["cooldown_until"] - now) if cooling else 0,
                         "active": k["id"] == p.get("active_key_id"),
+                        "quota": k.get("quota"),
                     })
                 out.append({
                     "id": p["id"], "name": p["name"], "base_url": p["base_url"],
@@ -189,6 +191,7 @@ def _load_logs():
 def add_log(entry):
     entry = dict(entry)
     entry["time"] = time.time()
+    _emit("request_logged", **{k: entry.get(k) for k in ("client", "status", "tokens_in", "tokens_out", "failovers")})
     with _log_lock:
         _load_logs()
         _logs.append(entry)
@@ -258,12 +261,127 @@ def open_upstream(url, headers, body, timeout):
             err = json.loads(raw)
         except Exception:
             err = {"error": {"message": raw[:300]}}
+        if not isinstance(err, dict):
+            err = {"error": {"message": raw[:300]}}
         retry_after = e.headers.get("Retry-After") if e.headers else None
         if retry_after:
             err["_retry_after"] = retry_after
+        quota = parse_quota(e.headers)
+        if quota:
+            err["_quota"] = quota
         return e.code, None, err
     except Exception as e:
         return 0, None, {"error": {"message": f"Connection error: {getattr(e, 'reason', e)}"}}
+
+
+# ---------------------------------------------------------------------------
+# Remaining quota, only as reported by the provider's rate-limit headers
+# (never guessed, never fetched from another endpoint).
+# ---------------------------------------------------------------------------
+_QUOTA_HEADERS = {   # bucket: [(limit, remaining, reset), ...] header families seen in the wild
+    "requests": [("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests"),
+                 ("anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+                  "anthropic-ratelimit-requests-reset"),
+                 ("x-ratelimit-requests-limit", "x-ratelimit-requests-remaining", "x-ratelimit-requests-reset"),
+                 ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"),
+                 ("ratelimit-limit", "ratelimit-remaining", "ratelimit-reset")],
+    "tokens": [("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"),
+               ("anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
+                "anthropic-ratelimit-tokens-reset"),
+               ("x-ratelimit-tokens-limit", "x-ratelimit-tokens-remaining", "x-ratelimit-tokens-reset"),
+               ("x-ratelimit-limit-tokens-minute", "x-ratelimit-remaining-tokens-minute",
+                "x-ratelimit-reset-tokens-minute")],
+    "requests_day": [("x-ratelimit-limit-requests-day", "x-ratelimit-remaining-requests-day",
+                      "x-ratelimit-reset-requests-day")],
+    "tokens_day": [("x-ratelimit-limit-tokens-day", "x-ratelimit-remaining-tokens-day",
+                    "x-ratelimit-reset-tokens-day")],
+}
+def quota_label(bucket):
+    return {"requests": i18n.t("quota.requests"), "tokens": i18n.t("quota.tokens"),
+            "requests_day": i18n.t("quota.requests_day"), "tokens_day": i18n.t("quota.tokens_day")}.get(bucket, bucket)
+
+
+LOW_QUOTA = 0.10
+
+
+def _num(v):
+    m = re.match(r"\s*(\d+(?:\.\d+)?)", str(v or ""))      # "100", "100, 100;w=60" -> 100
+    return int(float(m.group(1))) if m else None
+
+
+def parse_quota(headers):
+    """{bucket: {"limit", "remaining", "reset"}} from rate-limit headers; {} when there are none."""
+    if not headers:
+        return {}
+    h = {k.lower(): v for k, v in headers.items()}
+    out = {}
+    for bucket, families in _QUOTA_HEADERS.items():
+        for lim, rem, reset in families:
+            remaining = _num(h.get(rem))
+            if remaining is None:
+                continue
+            out[bucket] = {"limit": _num(h.get(lim)), "remaining": remaining, "reset": str(h.get(reset) or "")[:40]}
+            break
+    return out
+
+
+def quota_text(quota):
+    """'طلبات 3/500 · tokens 1.2k/10k' for messages; '' when nothing was reported."""
+    def n(v):
+        return "?" if v is None else f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.1f}k" if v >= 1e4 else str(v)
+    buckets = (quota or {}).get("buckets") or {}
+    return " · ".join(f"{quota_label(b)} {n(q['remaining'])}/{n(q.get('limit'))}" for b, q in buckets.items())
+
+
+def record_quota(provider, key, quota):
+    """Keep the latest reported numbers on the key; warn (event) when a bucket is under LOW_QUOTA."""
+    if not quota:
+        return
+    with store().lock:
+        key["quota"] = {"at": time.time(), "buckets": quota}
+    for bucket, q in quota.items():
+        if q.get("limit") and q["remaining"] < q["limit"] * LOW_QUOTA:
+            _emit("quota_low", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                  key=mask_key(key["key"]), bucket=quota_label(bucket), remaining=q["remaining"],
+                  limit=q["limit"], reset=q.get("reset", ""))
+
+
+def switch_active_key(ref):
+    """Make the next available key (not cooling down, not rejected) the active ★ one.
+    `ref` is a provider name or id. Returns (provider, old_key_or_None, new_key)."""
+    st = store()
+    ref = str(ref or "").strip().lower()
+    with st.lock:
+        p = next((p for p in st.providers() if p["id"].lower() == ref or p["name"].lower() == ref), None)
+        if not p:
+            raise ValueError(i18n.t("err.unknown_provider"))
+        keys, now = p.get("keys", []), time.time()
+        cur = p.get("active_key_id")
+        idx = next((i for i, k in enumerate(keys) if k["id"] == cur), -1)
+        order = keys[idx + 1:] + keys[:idx + 1]
+        new = next((k for k in order if k["id"] != cur and k.get("cooldown_until", 0) <= now
+                    and k.get("status") != "invalid"), None)
+        if not new:
+            raise ValueError(i18n.t("err.no_other_key"))
+        old = next((k for k in keys if k["id"] == cur), None)
+        p["active_key_id"] = new["id"]
+        st.save()
+        return p, old, new
+
+
+def provider_status_lines():
+    """One line per provider: active key, working / cooling counts, reported quota."""
+    now, lines = time.time(), []
+    for p in store().providers():
+        keys = p.get("keys", [])
+        cooling = sum(1 for k in keys if k.get("cooldown_until", 0) > now)
+        working = sum(1 for k in keys if k.get("status") == "ok" and k.get("cooldown_until", 0) <= now)
+        active = next((k for k in keys if k["id"] == p.get("active_key_id")), None)
+        q = quota_text(active.get("quota")) if active else ""
+        lines.append(i18n.t("bot.status_line", paused="⏸ " if not p.get("enabled", True) else "", name=p["name"],
+                            active="★ " + mask_key(active["key"]) if active else "★ —", working=working,
+                            cooling=cooling, total=len(keys)) + (f" · 📊 {q}" if q else ""))
+    return lines
 
 
 def short_error(err):
@@ -340,8 +458,122 @@ def mark_key(provider, key, ok, kind=None, error="", retry_after=None):
         st.save()
 
 
+# Event hook for alerts (set by alerts.py): ON_EVENT(kind, **info). Never gets message content or full keys.
+ON_EVENT = lambda kind, **info: None
+
+
+def _emit(kind, **info):
+    try:
+        ON_EVENT(kind, **info)
+    except Exception:
+        pass
+
+
+ALERT_KINDS = ("invalid", "no_credit", "limited", "error")
+
 # (provider id, model) pairs that rejected the client's max_tokens: we omit it for them.
 NO_MAX_TOKENS = set()
+
+
+# ---------------------------------------------------------------------------
+# Reasoning effort: an agent's model can carry "@<level>" (e.g. "gpt-5@high").
+# The gateway strips it for routing and writes the matching upstream parameter.
+# ---------------------------------------------------------------------------
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# (provider id, model, level) that rejected the effort parameter: sent without it.
+NO_EFFORT = set()
+EXTRA_MODELS = lambda: []          # agents.py adds the "@level" names its agents use to /v1/models
+
+_REASONING_RE = re.compile(
+    r"(^|[/:_-])o[134]($|[-_.])|gpt-5(?!(\.\d+)?-chat)|gpt-oss|claude-(3[-.]7|.*(opus|sonnet|haiku)-[4-9]|[4-9])"
+    r"|claude-(fable|mythos)|gemini-(2\.5|[3-9])|deepseek-(r1|reasoner|v3\.[1-9]|v[4-9])|qwq|qwen3|grok-(3-mini|[4-9])"
+    r"|glm-(4\.[5-9]|[5-9])|kimi-k2[.-]?(thinking|[5-9])|minimax-m[1-9]|magistral|ernie-.*thinking|seed-.*thinking"
+    r"|think|reason|(^|[/-])r1($|[-:])")
+_NOT_REASONING_RE = re.compile(r"non-?reasoning|no-?think|chat-latest|embed|tts|whisper|image|audio")
+
+
+def split_effort(model):
+    """("gpt-5@high") -> ("gpt-5", "high"); names without a known level come back unchanged."""
+    model = str(model or "")
+    base, sep, level = model.rpartition("@")
+    return (base, level) if sep and base and level in EFFORTS else (model, "")
+
+
+def with_effort(model, level):
+    return f"{model}@{level}" if level in EFFORTS else model
+
+
+def supports_reasoning(model):
+    """Best guess from the name: providers' /models lists don't say which models think."""
+    name = str(model or "").lower()
+    if _NOT_REASONING_RE.search(name):
+        return False
+    if "instruct" in name and not re.search(r"think|reason", name):
+        return False                        # e.g. qwen3-*-instruct-2507 is the non-thinking build
+    return bool(_REASONING_RE.search(name))
+
+
+# Claude models that take adaptive thinking + output_config.effort (budget_tokens is refused there).
+_ADAPTIVE_RE = re.compile(r"(opus|sonnet)-4[-.][6-9]|claude-(opus-|sonnet-|haiku-)?[5-9]|fable|mythos")
+_BUDGET = {"minimal": 1024, "low": 4000, "medium": 10000, "high": 20000, "xhigh": 32000, "max": 48000}
+
+
+def _needs_thinking_block(body):
+    """Anthropic refuses thinking when the last assistant turn used a tool without a thinking block
+    (translated histories lose them), or when a tool call is forced."""
+    if (body.get("tool_choice") or {}).get("type") in ("any", "tool"):
+        return True
+    for m in reversed(body.get("messages") or []):
+        if m.get("role") == "assistant":
+            c = m.get("content")
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_use" for b in c):
+                first = c[0] if c and isinstance(c[0], dict) else {}
+                return first.get("type") not in ("thinking", "redacted_thinking")
+            return False
+    return False
+
+
+def apply_effort(body, up_fmt, provider, model, level):
+    """Write `level` into an upstream request body, in place (the client's own setting is replaced)."""
+    if up_fmt == "anthropic":
+        body.pop("thinking", None)
+        oc = dict(body.get("output_config") or {})
+        oc.pop("effort", None)
+        name = model.lower()
+        blocked = _needs_thinking_block(body)
+        if _ADAPTIVE_RE.search(name):
+            eff = {"none": "low", "minimal": "low"}.get(level, level)
+            if eff == "xhigh" and re.search(r"4[-.]6", name):
+                eff = "high"                # 4.6 has no xhigh
+            oc["effort"] = eff
+            if level != "none" and not blocked:
+                body["thinking"] = {"type": "adaptive"}
+        elif level != "none" and not blocked:
+            budget = _BUDGET[level]
+            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            if int(body.get("max_tokens") or 0) <= budget:
+                body["max_tokens"] = budget + 8000
+        if oc:
+            body["output_config"] = oc
+        else:
+            body.pop("output_config", None)
+        if body.get("thinking"):
+            for k in ("temperature", "top_p", "top_k"):   # not allowed together with thinking
+                body.pop(k, None)
+    else:
+        body.pop("reasoning_effort", None)
+        body.pop("reasoning", None)
+        eff = "xhigh" if level == "max" else level
+        if "openrouter.ai" in provider.get("base_url", "").lower():
+            body["reasoning"] = {"effort": eff}
+        else:
+            body["reasoning_effort"] = eff
+    return body
+
+
+def _effort_rejected(err):
+    text = short_error(err).lower()
+    return any(w in text for w in ("reasoning", "effort", "thinking", "output_config"))
 
 
 class GatewayError(Exception):
@@ -356,7 +588,7 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
     Returns (provider, key, upstream_fmt, upstream_model, response, attempts).
     Only failures that happen before any byte reaches the client are retried.
     """
-    model = str(body.get("model") or "")
+    model, level = split_effort(body.get("model"))
     if not model:
         raise GatewayError(400, "The request has no model.", "invalid_request_error")
     targets = resolve_targets(model)
@@ -367,7 +599,7 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
 
     attempts = []
     last_status, last_err = 502, "No provider answered."
-    for provider, upstream_model in targets:
+    for t_index, (provider, upstream_model) in enumerate(targets):
         up_fmt = provider.get("format", "openai")
         if client_fmt == up_fmt:
             up_body = dict(body)
@@ -382,9 +614,19 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
         url = upstream_url(provider, up_fmt)
         if (provider["id"], upstream_model) in NO_MAX_TOKENS:
             up_body.pop("max_tokens", None)
-        for key in ordered_keys(provider):
+        plain_body = up_body
+        effort_on = bool(level) and (provider["id"], upstream_model, level) not in NO_EFFORT
+        if effort_on:
+            up_body = apply_effort(json.loads(json.dumps(up_body)), up_fmt, provider, upstream_model, level)
+        keys, model_missing = ordered_keys(provider), False
+        for k_index, key in enumerate(keys):
             headers = upstream_headers(provider, key["key"], incoming_headers)
             status, resp, err = open_upstream(url, headers, up_body, timeout)
+            if status == 400 and effort_on and _effort_rejected(err):
+                # This model/provider doesn't take that thinking level: send the request as it was.
+                NO_EFFORT.add((provider["id"], upstream_model, level))
+                effort_on, up_body = False, plain_body
+                status, resp, err = open_upstream(url, headers, up_body, timeout)
             if status == 400 and up_fmt == "openai" and "max_tokens" in short_error(err).lower() \
                     and "max_tokens" in up_body:
                 # Agents like Claude Code ask for very large max_tokens that many
@@ -394,7 +636,10 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                 NO_MAX_TOKENS.add((provider["id"], upstream_model))
                 status, resp, err = open_upstream(url, headers, up_body, timeout)
             if resp is not None and 200 <= status < 300:
+                record_quota(provider, key, parse_quota(resp.headers))
                 mark_key(provider, key, True)
+                _emit("key_ok", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                      key=mask_key(key["key"]))
                 return provider, key, up_fmt, upstream_model, resp, attempts
             kind, try_next = classify(status, err)
             msg = short_error(err)
@@ -402,10 +647,21 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                              "status": status, "reason": kind})
             last_status, last_err = (status or 502), msg
             if kind == "model_missing":
+                model_missing = True
                 break                              # same model on this provider's other keys: pointless
+            record_quota(provider, key, (err or {}).get("_quota"))
             mark_key(provider, key, False, kind, msg, (err or {}).get("_retry_after"))
+            if kind in ALERT_KINDS:
+                later = targets[t_index + 1:]
+                _emit("key_failed", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
+                      key=mask_key(key["key"]), reason=kind, status=status, quota=quota_text(key.get("quota")),
+                      next_key=mask_key(keys[k_index + 1]["key"]) if k_index + 1 < len(keys) else "",
+                      next_provider=later[0][0]["name"] if later else "")
             if not try_next:
                 raise GatewayError(status, msg, "invalid_request_error")
+        now = time.time()
+        if not model_missing and keys and all(k.get("cooldown_until", 0) > now for k in provider.get("keys", [])):
+            _emit("provider_down", provider_id=provider["id"], provider=provider["name"], keys=len(keys))
     raise GatewayError(last_status if last_status in (401, 402, 403, 404, 429) else 502,
                        f"All keys failed. Last error: {last_err}")
 
@@ -588,10 +844,12 @@ def openai_to_anthropic_response(res, model):
 
 
 def anthropic_to_openai_response(res, model):
-    text, tool_calls = "", []
+    text, thinking, tool_calls = "", "", []
     for b in res.get("content") or []:
         if b.get("type") == "text":
             text += b.get("text", "")
+        elif b.get("type") == "thinking":
+            thinking += b.get("thinking", "")
         elif b.get("type") == "tool_use":
             tool_calls.append({"id": b.get("id"), "type": "function",
                                "function": {"name": b.get("name"),
@@ -599,6 +857,8 @@ def anthropic_to_openai_response(res, model):
     msg = {"role": "assistant", "content": text or (None if tool_calls else "")}
     if tool_calls:
         msg["tool_calls"] = tool_calls
+    if thinking:
+        msg["reasoning_content"] = thinking          # the field OpenAI-style clients show as reasoning
     usage = res.get("usage") or {}
     inp, outp = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
     return {"id": res.get("id") or new_id("chatcmpl-"), "object": "chat.completion", "created": int(time.time()),
@@ -753,6 +1013,8 @@ def anthropic_stream_to_openai(resp, model, usage):
             d = obj.get("delta") or {}
             if d.get("type") == "text_delta":
                 yield chunk({"content": d.get("text", "")})
+            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                yield chunk({"reasoning_content": d["thinking"]})
             elif d.get("type") == "input_json_delta" and obj.get("index") in block_is_tool:
                 yield chunk({"tool_calls": [{"index": block_is_tool[obj["index"]],
                                              "function": {"arguments": d.get("partial_json", "")}}]})
@@ -834,6 +1096,10 @@ def handle(handler, method):
                 if not any(d["id"] == m for d in data):
                     data.append({"id": m, "object": "model", "type": "model", "created": now,
                                  "owned_by": p["name"], "display_name": m})
+        for m in EXTRA_MODELS():
+            if not any(d["id"] == m for d in data):
+                data.append({"id": m, "object": "model", "type": "model", "created": now,
+                             "owned_by": "gateway", "display_name": m})
         return _send_json(handler, 200, {"object": "list", "data": data, "has_more": False,
                                          "first_id": data[0]["id"] if data else None,
                                          "last_id": data[-1]["id"] if data else None})
@@ -861,6 +1127,14 @@ def handle(handler, method):
     log = {"client": _client_name(handler), "format": client_fmt, "model": model, "stream": stream}
     incoming = {k.lower(): v for k, v in handler.headers.items()}
 
+    _emit("request", client=log["client"], phase="start")
+    try:
+        return _proxy(handler, body, client_fmt, model, stream, start, log, incoming)
+    finally:
+        _emit("request", client=log["client"], phase="end")
+
+
+def _proxy(handler, body, client_fmt, model, stream, start, log, incoming):
     try:
         provider, key, up_fmt, up_model, resp, attempts = dispatch(client_fmt, body, incoming)
     except GatewayError as e:
