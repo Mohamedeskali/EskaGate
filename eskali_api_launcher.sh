@@ -13,6 +13,19 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 
+# Message in the language picked in the page (i18n/<lang>.json, default Arabic):
+#   t <key> [name=value ...] [lang=xx]. Without Python the line is read from the JSON file.
+t() {
+  local out arg lang=""
+  if out="$("$PYTHON_BIN" "$SCRIPT_DIR/i18n.py" "$@" 2>/dev/null)"; then printf '%s\n' "$out"; return; fi
+  for arg in "${@:2}"; do [[ $arg == lang=* ]] && lang="${arg#lang=}"; done
+  [[ -n $lang ]] || lang="$(sed -n 's/.*"lang": *"\([a-z]*\)".*/\1/p' "${API_CONSOLE_HOME:-$HOME/.api-test-console}/ui-settings.json" 2>/dev/null)"
+  [[ -f "$SCRIPT_DIR/i18n/$lang.json" ]] || lang=ar
+  out="$(sed -n "s/^ *\"$1\": \"\(.*\)\",\{0,1\}\$/\1/p" "$SCRIPT_DIR/i18n/$lang.json")"
+  for arg in "${@:2}"; do out="${out//\{${arg%%=*}\}/${arg#*=}}"; done
+  printf '%s\n' "$out"
+}
+
 notify() {
   command -v notify-send >/dev/null 2>&1 && notify-send -i "$SCRIPT_DIR/assets/eskali_api_icon.png" "EskaGate" "$1"
   echo "$1"
@@ -39,12 +52,12 @@ case "${1:-start}" in
   stop)
     if is_running; then
       kill "$(cat "$PID_FILE")" && rm -f "$PID_FILE"
-      notify "توقف EskaGate."
+      notify "$(t launcher.stopped)"
     elif is_dashboard; then
-      notify "EskaGate شاعل من الطرفية، وقفو تما بـ Ctrl+C."
+      notify "$(t launcher.from_terminal)"
     else
       rm -f "$PID_FILE"
-      notify "EskaGate ماشي شاعل."
+      notify "$(t launcher.not_running)"
     fi
     exit 0
     ;;
@@ -54,11 +67,11 @@ esac
 
 if ! is_running && ! is_dashboard; then
   if port_open; then
-    notify "البورت $PORT مستعمل من برنامج آخر."
+    notify "$(t launcher.port_busy port="$PORT")"
     exit 1
   fi
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    notify "Python 3 ماكاينش. ثبتو بـ: sudo apt install python3"
+    notify "$(t launcher.no_python)"
     exit 1
   fi
   cd "$SCRIPT_DIR"
@@ -67,7 +80,7 @@ if ! is_running && ! is_dashboard; then
   for _ in $(seq 1 50); do
     port_open && break
     if ! is_running; then
-      notify "EskaGate ما بغاش يخدم. شوف: $LOG_FILE"
+      notify "$(t launcher.failed log="$LOG_FILE")"
       rm -f "$PID_FILE"
       exit 1
     fi
