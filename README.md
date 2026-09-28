@@ -9,7 +9,7 @@ A local web app for testing API keys and running a local AI gateway. It uses onl
   - Anthropic clients: `http://127.0.0.1:8000`
 - **Coding agents:** switches Claude Code, opencode, pi, Hermes or a custom agent onto the gateway and restores their original config afterwards.
 
-The UI is in Moroccan Darija. Keys and settings are stored in `~/.api-test-console/` (on Windows `%USERPROFILE%\.api-test-console\`), which only your user can read.
+The UI is available in Arabic (Moroccan Darija, the default), English and French. Pick the language from the menu at the top of the page or in ⚙️ Settings; the page switches between right-to-left and left-to-right, and the choice is remembered. Keys and settings are stored in `~/.api-test-console/` (on Windows `%USERPROFILE%\.api-test-console\`), which only your user can read.
 
 ## Install in one line
 
@@ -176,6 +176,8 @@ EskaGate says the port is used by another program, or you see `Address already i
 | `api_web_dashboard_v2.py` | Server and the whole web page |
 | `gateway.py` | Local AI gateway (keys, failover, format translation, logs) |
 | `agents.py` | Coding-agent config switching |
+| `i18n.py`, `i18n/` | Translations: `ar.json`, `en.json`, `fr.json` (same keys) and the helper that loads them |
+| `tests/` | Checks: `python3 -m unittest discover tests` |
 | `get.sh`, `get.ps1` | One-line installers for Ubuntu and Windows |
 | `run-api-dashboard.sh` | Linux: run in a terminal |
 | `eskali_api_launcher.sh`, `install_eskali_api.sh` | Linux: background launcher and app installer |
@@ -183,6 +185,12 @@ EskaGate says the port is used by another program, or you see `Address already i
 | `assets/` | App icons (`.png` for Linux, `.ico` for Windows) |
 | `docs/screenshots/` | Screenshots used in this README |
 | `LICENSE` | MIT license |
+
+## Translations
+
+Every piece of text in the page, the server messages, the launcher and the Linux installer comes from `i18n/<lang>.json`. The three files must have the same keys; `python3 -m unittest discover tests` checks that, and also checks that every key the code uses exists and that the English and French pages have no Arabic left in them. Values can hold `{name}` placeholders. To add a string, add the key to all three files, then use `{{t:key}}` in the HTML, `T('key', {name})` in the page's JavaScript, `i18n.t("key", name=...)` in Python, or `t key name=...` in the shell scripts.
+
+The one-line installers (`get.sh`, `get.ps1`) and the Windows `.bat`/`.vbs` files stay in English: they run before the translation files are on disk, or cannot read them.
 
 ## License
 
