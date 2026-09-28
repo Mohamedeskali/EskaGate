@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 
 import gateway
+import i18n
 
 CONFIG_FILE = gateway.DATA_DIR / "telegram.json"        # settings (see load())
 STATS_FILE = gateway.DATA_DIR / "alert-stats.json"      # per-agent counters since the last summary, quota warnings
@@ -34,8 +35,13 @@ TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 CHAT_RE = re.compile(r"^(-?\d{3,}|@[A-Za-z0-9_]{5,})$")
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
-REASON = {"invalid": "مرفوض (المفتاح غالط ولا تحيد)", "no_credit": "سالا الرصيد",
-          "limited": "وصل للحد (rate limit)", "error": "المزود طايح ولا ما جاوبش"}
+
+
+def reason_text(kind):
+    """Why a key failed, in the page's language (messages follow the language picked in the app)."""
+    return {"invalid": i18n.t("alert.reason.invalid"), "no_credit": i18n.t("alert.reason.no_credit"),
+            "limited": i18n.t("alert.reason.limited"), "error": i18n.t("alert.reason.error")}.get(kind, kind)
+
 
 _lock = threading.RLock()
 _queue = queue.Queue()
@@ -79,11 +85,11 @@ def _merged(data):
     chat = str(data.get("chat_id") or "").strip()
     if token:
         if not TOKEN_RE.match(token):
-            raise ValueError("الـ Bot token ماشي صحيح. خودو كامل من @BotFather (بحال 123456:ABC...).")
+            raise ValueError(i18n.t("tg.err_token"))
         c["bot_token"] = token
     if chat:
         if not CHAT_RE.match(chat):
-            raise ValueError("الـ Chat ID خاصو يكون رقم (ولا @channel).")
+            raise ValueError(i18n.t("tg.err_chat"))
         c["chat_id"] = chat
     for k in ("enabled", "summary"):
         if k in data:
@@ -92,11 +98,11 @@ def _merged(data):
         try:
             c["idle_minutes"] = max(0, min(int(data["idle_minutes"]), 1440))
         except (TypeError, ValueError):
-            raise ValueError("عدد الدقايق خاصو يكون رقم.")
+            raise ValueError(i18n.t("tg.err_minutes"))
     if data.get("summary_time"):
         m = TIME_RE.match(str(data["summary_time"]).strip())
         if not m:
-            raise ValueError("الوقت ديال الملخص خاصو يكون بحال 09:00.")
+            raise ValueError(i18n.t("tg.err_time"))
         c["summary_time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
     return c
 
@@ -160,31 +166,31 @@ def _call(token, method, payload=None, timeout=15):
             desc = ""
         raise ValueError(f"Telegram: {desc or 'HTTP ' + str(e.code)}")
     except Exception as e:
-        raise ValueError(f"ما قدرتش نوصل لـ Telegram ({type(e).__name__}).")
+        raise ValueError(i18n.t("tg.err_unreachable", error=type(e).__name__))
 
 
 def send_now(text, cfg=None):
     c = cfg or load()
     if not (c["bot_token"] and c["chat_id"]):
-        raise ValueError("عمّر الـ Bot token والـ Chat ID بعدا.")
+        raise ValueError(i18n.t("tg.err_missing"))
     _call(c["bot_token"], "sendMessage", {"chat_id": c["chat_id"], "text": text,
                                            "disable_web_page_preview": True})
 
 
 def test(data):
-    send_now("✅ EskaGate: رسالة تجريبية. التنبيهات ديال الـ gateway غادي يوصلو هنا.", _merged(data))
+    send_now(i18n.t("tg.test_msg"), _merged(data))
 
 
 def find_chat_id(data):
     """Chat ID of the last message sent to the bot (the user writes /start to it first)."""
     c = _merged(data)
     if not c["bot_token"]:
-        raise ValueError("كتب الـ Bot token بعدا.")
+        raise ValueError(i18n.t("tg.err_token_first"))
     if _poller["running"] and _ready(c):
         # The command poller already reads the updates (Telegram allows one reader at a time).
         if _last_chat:
             return dict(_last_chat)
-        raise ValueError("صيفط /start للبوت ديالك فـ Telegram، وعاود ضغط بعد شي ثواني.")
+        raise ValueError(i18n.t("tg.err_start_retry"))
     res = _call(c["bot_token"], "getUpdates", {"limit": 20})
     for upd in reversed(res.get("result") or []):
         msg = upd.get("message") or upd.get("channel_post") or upd.get("my_chat_member") or {}
@@ -192,7 +198,7 @@ def find_chat_id(data):
         if chat.get("id") is not None:
             return {"chat_id": str(chat["id"]),
                     "name": chat.get("title") or chat.get("first_name") or chat.get("username") or ""}
-    raise ValueError("ما لقيت حتى رسالة. صيفط /start للبوت ديالك فـ Telegram، وعاود.")
+    raise ValueError(i18n.t("tg.err_no_message"))
 
 
 def _log_history(item, sent, error=""):
@@ -275,18 +281,17 @@ def _handle(kind, i):
         with _lock:
             _failed_keys[(pid, i["key_id"])] = i["reason"]
         code = f" (HTTP {i['status']})" if i.get("status") else ""
-        nxt = (f"↪️ دوزت للمفتاح {i['next_key']}." if i.get("next_key")
-               else f"↪️ دوزت للمزود {i['next_provider']}." if i.get("next_provider")
-               else "↪️ ما بقا حتى مفتاح آخر نجربو.")
-        quota = f"\n📊 آخر رقم صرح بيه المزود: {i['quota']}" if i.get("quota") else ""
-        notify(pid, i["reason"], f"⚠️ EskaGate · {name}\nالمفتاح {i['key']}: "
-               f"{REASON.get(i['reason'], i['reason'])}{code}.{quota}\n{nxt}", provider=name)
+        nxt = (i18n.t("alert.next_key", key=i["next_key"]) if i.get("next_key")
+               else i18n.t("alert.next_provider", provider=i["next_provider"]) if i.get("next_provider")
+               else i18n.t("alert.no_next"))
+        quota = i18n.t("alert.quota_line", quota=i["quota"]) if i.get("quota") else ""
+        notify(pid, i["reason"], i18n.t("alert.key_failed", name=name, key=i["key"], reason=reason_text(i["reason"]),
+                                        code=code, quota=quota, next=nxt), provider=name)
     elif kind == "provider_down":
         pid = i["provider_id"]
         with _lock:
             _down.add(pid)
-        notify(pid, "down", f"🔴 EskaGate · {i['provider']}\nجميع المفاتيح ({i['keys']}) طايحين. "
-                            "الطلبات ما غاديش تدوز من هاد المزود حتى يرجع واحد فيهم.",
+        notify(pid, "down", i18n.t("alert.provider_down", provider=i["provider"], keys=i["keys"]),
                provider=i["provider"], kind="provider_down")
     elif kind == "key_ok":
         pid, key = i["provider_id"], (i["provider_id"], i["key_id"])
@@ -295,7 +300,7 @@ def _handle(kind, i):
             was_failed = _failed_keys.pop(key, None)
             _down.discard(pid)
         if was_down or was_failed:
-            notify(pid, "recovered", f"✅ EskaGate · {i['provider']}\nرجع كلشي عادي: المفتاح {i['key']} خدام.",
+            notify(pid, "recovered", i18n.t("alert.recovered", provider=i["provider"], key=i["key"]),
                    provider=i["provider"])
     elif kind == "quota_low":
         today = datetime.date.today().isoformat()
@@ -305,10 +310,10 @@ def _handle(kind, i):
                 return
             st["quota_warned"][i["key_id"]] = today
             st["dirty"] = True
-        reset = f" كيرجع: {i['reset']}." if i.get("reset") else ""
+        reset = i18n.t("alert.reset", reset=i["reset"]) if i.get("reset") else ""
         pct = int(i["remaining"] * 100 / i["limit"]) if i.get("limit") else 0
-        _enqueue(f"🟠 EskaGate · {i['provider']}\nالمفتاح {i['key']} قرب يسالي: {i['bucket']} باقي "
-                 f"{i['remaining']} من {i['limit']} ({pct}%).{reset}\nهادا تنبيه قبل ما يطيح (مرة فالنهار لكل مفتاح).",
+        _enqueue(i18n.t("alert.quota_low", provider=i["provider"], key=i["key"], bucket=i["bucket"],
+                        remaining=i["remaining"], limit=i["limit"], pct=pct, reset=reset),
                  "quota_low", provider=i["provider"])
         _save_stats()
     elif kind == "request_logged":
@@ -337,7 +342,7 @@ def _handle(kind, i):
             woke = c["idle"]
             c["idle"] = False
         if woke:
-            notify("agent:" + name, "active", f"✅ EskaGate · {name}\nرجع كيبعث الطلبات.", agent=name)
+            notify("agent:" + name, "active", i18n.t("alert.active", name=name), agent=name)
 
 
 def check_idle(now=None):
@@ -352,8 +357,8 @@ def check_idle(now=None):
         for n, _ in quiet:
             _clients[n]["idle"] = True
     for n, last in quiet:
-        notify("agent:" + n, "idle", f"💤 EskaGate · {n}\nما بعث حتى طلب هادي {minutes} دقيقة "
-                                     f"(آخر طلب {time.strftime('%H:%M', time.localtime(last))}).", agent=n)
+        notify("agent:" + n, "idle", i18n.t("alert.idle", name=n, minutes=minutes,
+                                            last=time.strftime("%H:%M", time.localtime(last))), agent=n)
 
 
 # ---------------------------------------------------------------------------
@@ -382,9 +387,9 @@ def check_summary(now=None):
     for name, a in sorted(agents.items(), key=lambda x: -x[1]["requests"]):
         if not a["requests"]:
             continue
-        errors = f" · {a['errors']} خطأ" if a.get("errors") else ""
-        _enqueue(f"📊 EskaGate · الملخص اليومي · {name}\nمن {start}: {a['requests']} طلب · "
-                 f"{_fmt_tokens(a['tokens'])} token · {a['switches']} تبديل ديال المفتاح{errors}",
+        errors = i18n.t("alert.summary_errors", n=a["errors"]) if a.get("errors") else ""
+        _enqueue(i18n.t("alert.summary", name=name, start=start, requests=a["requests"],
+                        tokens=_fmt_tokens(a["tokens"]), switches=a["switches"], errors=errors),
                  "summary", agent=name)
     _save_stats(force=True)
     return True
@@ -403,8 +408,6 @@ def _ticker():
 # ---------------------------------------------------------------------------
 # Bot commands (long polling). Only the configured chat is answered.
 # ---------------------------------------------------------------------------
-HELP = ("🤖 EskaGate\n/status: الحالة ديال كل مزود\n/switch <provider>: دير المفتاح الجاي هو ★ ديال هاد المزود")
-
 
 def handle_command(text):
     """Reply text for a bot command."""
@@ -413,20 +416,20 @@ def handle_command(text):
     arg = parts[1].strip() if len(parts) > 1 else ""
     if cmd == "/status":
         lines = gateway.provider_status_lines()
-        return "📋 EskaGate\n" + ("\n".join(lines) if lines else "ما كاين حتى مزود.")
+        return "📋 EskaGate\n" + ("\n".join(lines) if lines else i18n.t("bot.no_providers"))
     if cmd == "/switch":
         if not arg:
             names = ", ".join(p["name"] for p in gateway.store().providers()) or "—"
-            return f"كتب اسم المزود: /switch <provider>\nالمزودين: {names}"
+            return i18n.t("bot.switch_usage", names=names)
         try:
             p, old, new = gateway.switch_active_key(arg)
         except ValueError as e:
-            msg = {"Unknown provider.": f"ما كاينش مزود سميتو «{arg}».",
-                   "No other available key.": f"«{arg}»: ما كاين حتى مفتاح آخر واجد (كلهم كيرتاحو ولا مرفوضين)."}
+            msg = {i18n.t("err.unknown_provider"): i18n.t("bot.unknown_provider", name=arg),
+                   i18n.t("err.no_other_key"): i18n.t("bot.no_other_key", name=arg)}
             return "❌ " + msg.get(str(e), str(e))
         was = gateway.mask_key(old["key"]) if old else "—"
-        return f"✅ {p['name']}: ★ ولا {gateway.mask_key(new['key'])} (كان {was})."
-    return HELP
+        return i18n.t("bot.switched", provider=p["name"], new=gateway.mask_key(new["key"]), old=was)
+    return i18n.t("bot.help")
 
 
 def _poll():

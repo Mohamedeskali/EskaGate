@@ -1713,7 +1713,7 @@ INDEX_HTML = r"""
     <button class="icon-btn" id="themeToggleBtn" title="{{t:hdr.theme}}" onclick="toggleTheme()">🌙</button>
     <button class="icon-btn" title="{{t:nav.keys}}" onclick="showTab('keys')">🔑</button>
     <button class="icon-btn" title="{{t:hdr.settings}}" onclick="openSettings()">⚙️</button>
-    <button class="icon-btn" id="phoneBtn" title="فتح من التيليفون (نفس الـ Wi-Fi)" onclick="openPhone()">📱</button>
+    <button class="icon-btn" id="phoneBtn" title="{{t:phone.btn_title}}" onclick="openPhone()">📱</button>
   </div>
 </header>
 
@@ -2001,14 +2001,14 @@ INDEX_HTML = r"""
     </div>
     <div class="card ah-card">
       <div class="card-head">
-        <h3>🔔 سجل التنبيهات</h3>
+        <h3>{{t:ah.title}}</h3>
         <div class="spacer"></div>
         <div class="ah-filters">
-          <select id="ahSource" onchange="renderAlertHistory()"><option value="">كل المزودين والوكلاء</option></select>
-          <select id="ahType" onchange="renderAlertHistory()"><option value="">كل الأنواع</option></select>
+          <select id="ahSource" onchange="renderAlertHistory()"><option value="">{{t:ah.all_sources}}</option></select>
+          <select id="ahType" onchange="renderAlertHistory()"><option value="">{{t:ah.all_types}}</option></select>
           <select id="ahPeriod" onchange="renderAlertHistory()">
-            <option value="month">هاد الشهر</option><option value="7">آخر 7 أيام</option>
-            <option value="30">آخر 30 يوم</option><option value="all">كلشي</option></select>
+            <option value="month">{{t:ah.month}}</option><option value="7">{{t:ah.days7}}</option>
+            <option value="30">{{t:ah.days30}}</option><option value="all">{{t:ah.all}}</option></select>
         </div>
       </div>
       <div id="ahCounts"></div>
@@ -2111,8 +2111,8 @@ INDEX_HTML = r"""
 <div class="modal-overlay" id="phoneOverlay" onclick="if(event.target===this) closePhone()">
   <div class="modal" style="width: min(440px, 100%);">
     <div class="modal-header">
-      <h2>📱 فتح من التيليفون</h2>
-      <button class="modal-close" onclick="closePhone()">إغلاق ✕</button>
+      <h2>{{t:phone.title}}</h2>
+      <button class="modal-close" onclick="closePhone()">{{t:common.close}}</button>
     </div>
     <div id="phoneBody"></div>
   </div>
@@ -2174,31 +2174,31 @@ INDEX_HTML = r"""
     <div class="tg-box">
       <div class="setting-row">
         <div>
-          <div class="s-label">✈️ تنبيهات Telegram</div>
-          <div class="s-sub">رسالة ملي يطيح مفتاح، ولا يطيحو جميع مفاتيح مزود، ولا يسكت وكيل، وملي يرجع كلشي عادي. كتوصلك حتى وانت برا.</div>
+          <div class="s-label">{{t:tg.title}}</div>
+          <div class="s-sub">{{t:tg.desc}}</div>
         </div>
-        <div class="toggle" id="tgToggle" title="تشغيل/إيقاف التنبيهات" onclick="toggleTelegram()"></div>
+        <div class="toggle" id="tgToggle" title="{{t:tg.toggle_title}}" onclick="toggleTelegram()"></div>
       </div>
       <div class="field"><label>Bot token <span class="tg-saved" id="tgTokenSaved"></span></label>
         <input id="tgToken" type="password" dir="ltr" autocomplete="off" placeholder="123456789:AA..."></div>
       <div class="field"><label>Chat ID <span class="tg-saved" id="tgChatSaved"></span></label>
         <div class="tg-inline"><input id="tgChat" dir="ltr" autocomplete="off" placeholder="123456789">
-          <button class="ghost" title="صيفط /start للبوت بعدا" onclick="findTelegramChat()">🔎 جيبو</button></div></div>
-      <div class="field"><label>نبهني إلا وكيل سكت كذا دقيقة (0 = لا)</label>
+          <button class="ghost" title="{{t:tg.find_title}}" onclick="findTelegramChat()">{{t:tg.find}}</button></div></div>
+      <div class="field"><label>{{t:tg.idle_label}}</label>
         <input id="tgIdle" type="number" min="0" max="1440" dir="ltr" placeholder="10"></div>
       <div class="setting-row tg-sub">
         <div>
-          <div class="s-label">📊 ملخص يومي</div>
-          <div class="s-sub">رسالة لكل وكيل خدم: شحال من طلب، شحال من token، وشحال من مرة تبدل المفتاح.</div>
+          <div class="s-label">{{t:tg.summary}}</div>
+          <div class="s-sub">{{t:tg.summary_desc}}</div>
         </div>
-        <input id="tgSummaryTime" type="time" dir="ltr" value="09:00" title="وقت الملخص (ساعة الـ PC)">
-        <div class="toggle" id="tgSummaryToggle" title="تشغيل/إيقاف الملخص" onclick="toggleSummary()"></div>
+        <input id="tgSummaryTime" type="time" dir="ltr" value="09:00" title="{{t:tg.summary_time_title}}">
+        <div class="toggle" id="tgSummaryToggle" title="{{t:tg.summary_toggle_title}}" onclick="toggleSummary()"></div>
       </div>
       <div class="tg-actions">
-        <button class="primary" onclick="saveTelegram()">💾 حفظ</button>
-        <button class="ghost" onclick="testTelegram()">📨 رسالة تجريبية</button>
+        <button class="primary" onclick="saveTelegram()">{{t:tg.save}}</button>
+        <button class="ghost" onclick="testTelegram()">{{t:tg.test}}</button>
       </div>
-      <p class="modal-desc tg-help">1) فـ Telegram حل <b dir="ltr">@BotFather</b>، كتب <code>/newbot</code> ونسخ الـ token. 2) صيفط <code>/start</code> للبوت ديالك، ومن بعد ضغط "🔎 جيبو" باش نلقاو الـ Chat ID. 3) حفظ وجرب. 4) من Telegram: <code dir="ltr">/status</code> كيعطيك الحالة، و<code dir="ltr">/switch provider</code> كيدير المفتاح الجاي هو ★. غير الـ Chat ID المحفوظ لي كيتسمع ليه. الرسائل فيها غير اسم المزود والوكيل ومفتاح مخبي، عمرها ما فيها المحادثات ولا المفاتيح كاملين. خلي الفيلد خاوي باش تبقى القيمة المحفوظة.</p>
+      <p class="modal-desc tg-help">{{h:tg.help}}</p>
     </div>
   </div>
 </div>
@@ -3456,7 +3456,7 @@ async function syncPhone() {
 async function openPhone() {
   document.getElementById('phoneOverlay').classList.add('open');
   const body = document.getElementById('phoneBody');
-  body.innerHTML = '<p class="modal-desc">كنحل الوصول من الشبكة...</p>';
+  body.innerHTML = `<p class="modal-desc">${T('phone.opening')}</p>`;
   try { phoneState = await api('/api/phone/start', {}); }
   catch (e) { body.innerHTML = `<p class="modal-desc" style="color:var(--bad)">${escapeHtml(e.message)}</p>`; return; }
   setPhoneBtn(); renderPhone();
@@ -3465,26 +3465,26 @@ function closePhone() { document.getElementById('phoneOverlay').classList.remove
 function renderPhone() {
   const st = phoneState || {}, body = document.getElementById('phoneBody');
   if (!st.on) {
-    body.innerHTML = `<p class="modal-desc">الوصول من التيليفون مسدود، والرابط القديم ما بقاش خدام.</p>
-      <div class="phone-actions"><button class="primary" onclick="openPhone()">📱 عاود حلّو</button></div>`;
+    body.innerHTML = `<p class="modal-desc">${T('phone.closed')}</p>
+      <div class="phone-actions"><button class="primary" onclick="openPhone()">${T('phone.reopen')}</button></div>`;
     return;
   }
-  body.innerHTML = `${st.here ? '<p class="modal-desc">📱 راك فاتح من التيليفون دابا.</p>' : ''}
-    <p class="modal-desc">سكاني الكود بكاميرا التيليفون. خاص التيليفون يكون فنفس الـ Wi-Fi ديال الـ PC. غادي يبان الموقع كامل.</p>
+  body.innerHTML = `${st.here ? `<p class="modal-desc">${T('phone.here')}</p>` : ''}
+    <p class="modal-desc">${T('phone.scan')}</p>
     <div class="qr-box">${st.qr}</div>
     <div class="phone-url"><code dir="ltr">${escapeHtml(st.url)}</code>
-      <button class="mini-copy" title="نسخ" onclick="copyRaw(phoneState && phoneState.url, this)">📋</button></div>
-    <p class="phone-help">🔒 الرابط فيه مفتاح سري: ما تعطيهش لشي حد. التيليفون كيتفكرو من بعد أول مرة، والـ PC ديما خدام بلا بيه.</p>
-    <details class="phone-help"><summary>ما بغاش يتحل فالتيليفون؟</summary>
-      <p>تأكد بلي بجوج فنفس الـ Wi-Fi (ماشي Wi-Fi ديال الضيوف). إلا كان عندك firewall فـ Ubuntu شعل:</p>
+      <button class="mini-copy" title="${escapeHtml(T('common.copy'))}" onclick="copyRaw(phoneState && phoneState.url, this)">📋</button></div>
+    <p class="phone-help">${T('phone.secret')}</p>
+    <details class="phone-help"><summary>${T('phone.trouble')}</summary>
+      <p>${T('phone.trouble_body')}</p>
       <code dir="ltr">sudo ufw allow from ${escapeHtml(st.ip.split('.').slice(0, 2).join('.'))}.0.0/16 to any port ${st.port} proto tcp</code></details>
-    <div class="phone-actions"><button class="ghost danger" onclick="stopPhone()">⛔ وقف الوصول من التيليفون</button></div>`;
+    <div class="phone-actions"><button class="ghost danger" onclick="stopPhone()">${T('phone.stop')}</button></div>`;
 }
 async function stopPhone() {
   try { phoneState = await api('/api/phone/stop', {}); }
-  catch (e) { toast('ما توقفش', 'bad', e.message); return; }
+  catch (e) { toast(T('phone.stop_failed'), 'bad', e.message); return; }
   setPhoneBtn(); renderPhone();
-  toast('تسد الوصول من التيليفون', 'ok', 'المفتاح السري تبدل، الرابط والكود القدام ما بقاوش خدامين.');
+  toast(T('phone.stopped'), 'ok', T('phone.stopped_body'));
 }
 
 /* ---- Telegram alerts (settings saved on the server, token/chat shown masked) ---- */
@@ -3496,14 +3496,14 @@ async function loadTelegram() {
 function renderTelegram() {
   const t = tgState || {};
   document.getElementById('tgToggle').classList.toggle('on', !!(t.enabled && t.configured));
-  document.getElementById('tgTokenSaved').innerHTML = t.bot_token ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.bot_token)}</bdi>` : '';
-  document.getElementById('tgChatSaved').innerHTML = t.chat_id ? `محفوظ: <bdi dir="ltr">${escapeHtml(t.chat_id)}</bdi>` : '';
+  document.getElementById('tgTokenSaved').innerHTML = t.bot_token ? T('tg.saved_value', { value: `<bdi dir="ltr">${escapeHtml(t.bot_token)}</bdi>` }) : '';
+  document.getElementById('tgChatSaved').innerHTML = t.chat_id ? T('tg.saved_value', { value: `<bdi dir="ltr">${escapeHtml(t.chat_id)}</bdi>` }) : '';
   document.getElementById('tgIdle').value = t.idle_minutes ?? 10;
   document.getElementById('tgSummaryToggle').classList.toggle('on', !!t.summary);
   document.getElementById('tgSummaryTime').value = t.summary_time || '09:00';
 }
 function toggleSummary() {
-  if (!(tgState || {}).configured) return toast('عمّر الـ Bot token والـ Chat ID وضغط حفظ بعدا', 'warn');
+  if (!(tgState || {}).configured) return toast(T('tg.fill_first'), 'warn');
   saveTelegram({ summary: !tgState.summary });
 }
 function tgForm() {
@@ -3513,27 +3513,27 @@ function tgForm() {
 }
 async function saveTelegram(extra) {
   try { tgState = await api('/api/telegram/save', { ...tgForm(), ...(extra || {}) }); }
-  catch (e) { toast('ما تحفظش', 'bad', e.message); return false; }
+  catch (e) { toast(T('common.not_saved'), 'bad', e.message); return false; }
   document.getElementById('tgToken').value = ''; document.getElementById('tgChat').value = '';
   renderTelegram();
-  toast(tgState.configured ? 'تحفظو إعدادات Telegram' : 'تحفظ، ولكن باقي خاص الـ token والـ Chat ID', tgState.configured ? 'ok' : 'warn');
+  toast(tgState.configured ? T('tg.saved') : T('tg.saved_incomplete'), tgState.configured ? 'ok' : 'warn');
   return true;
 }
 function toggleTelegram() {
   const t = tgState || {};
-  if (!t.configured) return toast('عمّر الـ Bot token والـ Chat ID وضغط حفظ بعدا', 'warn');
+  if (!t.configured) return toast(T('tg.fill_first'), 'warn');
   saveTelegram({ enabled: !t.enabled });
 }
 async function testTelegram() {
-  try { await api('/api/telegram/test', tgForm()); toast('تصيفطات. شوف Telegram 📨', 'ok'); }
-  catch (e) { toast('ما تصيفطاتش', 'bad', e.message); }
+  try { await api('/api/telegram/test', tgForm()); toast(T('tg.sent'), 'ok'); }
+  catch (e) { toast(T('tg.send_failed'), 'bad', e.message); }
 }
 async function findTelegramChat() {
   try {
     const r = await api('/api/telegram/chat-id', { bot_token: document.getElementById('tgToken').value.trim() });
     document.getElementById('tgChat').value = r.chat_id;
-    toast('لقيت الـ Chat ID' + (r.name ? ` (${r.name})` : ''), 'ok', 'ضغط حفظ باش يتسجل.');
-  } catch (e) { toast('ما لقيتش', 'bad', e.message); }
+    toast(T('tg.chat_found') + (r.name ? ` (${r.name})` : ''), 'ok', T('tg.press_save'));
+  } catch (e) { toast(T('tg.not_found'), 'bad', e.message); }
 }
 
 
@@ -3568,14 +3568,14 @@ async function loadGateway() {
 
 /* ---------------- providers ---------------- */
 // Remaining quota, only as the provider reported it in its rate-limit headers (never guessed).
-const QUOTA_LABEL = { requests: 'طلبات', tokens: 'tokens', requests_day: 'طلبات/نهار', tokens_day: 'tokens/نهار' };
+const QUOTA_LABEL = { requests: T('quota.requests'), tokens: T('quota.tokens'), requests_day: T('quota.requests_day'), tokens_day: T('quota.tokens_day') };
 function fmtCount(n) { return n == null ? '?' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n); }
 function quotaHtml(q) {
   const b = q && q.buckets ? Object.entries(q.buckets) : [];
-  if (!b.length) return '<span class="quota" title="المزود ما كيصرحش بالباقي فالـ headers ديالو">📊 الباقي: ما مصرحش</span>';
+  if (!b.length) return `<span class="quota" title="${escapeHtml(T('quota.not_reported_title'))}">${T('quota.not_reported')}</span>`;
   const parts = b.map(([name, v]) => {
     const low = v.limit && v.remaining < v.limit * 0.1;
-    return `<span class="${low ? 'low' : ''}" title="${v.reset ? 'كيرجع: ' + escapeHtml(v.reset) : ''}">${QUOTA_LABEL[name] || escapeHtml(name)} <b dir="ltr">${fmtCount(v.remaining)}/${fmtCount(v.limit)}</b>${low ? ' ⚠️' : ''}</span>`;
+    return `<span class="${low ? 'low' : ''}" title="${v.reset ? escapeHtml(T('quota.resets', { reset: v.reset })) : ''}">${QUOTA_LABEL[name] || escapeHtml(name)} <b dir="ltr">${fmtCount(v.remaining)}/${fmtCount(v.limit)}</b>${low ? ' ⚠️' : ''}</span>`;
   });
   return `<span class="quota">📊 ${parts.join(' · ')} <span class="q-at">${timeAgo(q.at * 1000)}</span></span>`;
 }
@@ -3837,9 +3837,9 @@ async function loadLogs() {
   }).join('');
 }
 /* ---- alert history (every Telegram alert sent, from alert-history.jsonl) ---- */
-const AH_TYPES = { no_credit: '💳 سالا الرصيد', invalid: '🚫 مفتاح مرفوض', limited: '⏱ rate limit', error: '🔥 المزود ما جاوبش',
-  provider_down: '🔴 المزود طايح كامل', recovered: '✅ رجع عادي', quota_low: '🟠 قرب يسالي', idle: '💤 وكيل سكت',
-  active: '▶️ وكيل رجع', summary: '📊 ملخص يومي' };
+const AH_TYPES = { no_credit: T('ah.type.no_credit'), invalid: T('ah.type.invalid'), limited: T('ah.type.limited'), error: T('ah.type.error'),
+  provider_down: T('ah.type.provider_down'), recovered: T('ah.type.recovered'), quota_low: T('ah.type.quota_low'), idle: T('ah.type.idle'),
+  active: T('ah.type.active'), summary: T('ah.type.summary') };
 let ahEntries = [];
 async function loadAlertHistory() {
   try { ahEntries = (await api('/api/alerts/history')).entries || []; } catch (e) { return; }
@@ -3864,16 +3864,16 @@ function renderAlertHistory() {
   const rows = {};
   list.forEach(e => { const r = rows[ahSource(e)] = rows[ahSource(e)] || {}; r[e.type] = (r[e.type] || 0) + 1; });
   document.getElementById('ahCounts').innerHTML = list.length ? `<div style="overflow-x:auto;"><table class="ah-counts">
-    <thead><tr><th></th>${types.map(t => `<th>${AH_TYPES[t]}</th>`).join('')}<th>المجموع</th></tr></thead>
+    <thead><tr><th></th>${types.map(t => `<th>${AH_TYPES[t]}</th>`).join('')}<th>${T('ah.total')}</th></tr></thead>
     <tbody>${Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])).map(([name, r]) => `<tr><td>${escapeHtml(name)}</td>
       ${types.map(t => `<td class="mono">${r[t] || '·'}</td>`).join('')}<td class="mono"><b>${Object.values(r).reduce((a, b) => a + b, 0)}</b></td></tr>`).join('')}</tbody>
-    </table></div>` : '<div class="empty-state" style="padding:14px;">ما كاين حتى تنبيه فهاد الفترة.</div>';
+    </table></div>` : `<div class="empty-state" style="padding:14px;">${T('ah.none')}</div>`;
   document.getElementById('ahList').innerHTML = list.slice(0, 100).map(e => `<div class="ah-row">
       <span class="mono ah-time">${new Date(e.time * 1000).toLocaleString()}</span>
-      <span class="pill ${e.sent === false ? 'bad' : 'pending'}">${AH_TYPES[e.type] || escapeHtml(e.type)}${e.sent === false ? ' · ما تصيفطش' : ''}</span>
+      <span class="pill ${e.sent === false ? 'bad' : 'pending'}">${AH_TYPES[e.type] || escapeHtml(e.type)}${e.sent === false ? T('ah.not_sent') : ''}</span>
       <span class="ah-src">${escapeHtml(ahSource(e))}</span>
       <span class="ah-msg" title="${escapeHtml(e.error || '')}">${escapeHtml(String(e.message || '').split('\n').slice(1).join(' · '))}</span>
-    </div>`).join('') + (list.length > 100 ? `<div class="ah-more">+${list.length - 100} قدام</div>` : '');
+    </div>`).join('') + (list.length > 100 ? `<div class="ah-more">${T('ah.more', { n: list.length - 100 })}</div>` : '');
 }
 async function clearGatewayLogs() {
   if (!confirm(T('gw.confirm_clear'))) return;
@@ -3966,8 +3966,8 @@ function modelMatches(m, query) {
   return query.toLowerCase().split(/\s+/).filter(Boolean).every(w => name.includes(w));
 }
 /* ---- thinking level: sent as "model@level", the gateway turns it into the provider's own parameter ---- */
-const EFFORT_LEVELS = [['', 'افتراضي (الوكيل كيختار)'], ['none', 'بلا تفكير (none)'], ['minimal', 'أدنى (minimal)'],
-  ['low', 'خفيف (low)'], ['medium', 'متوسط (medium)'], ['high', 'عالي (high)'], ['xhigh', 'عالي بزاف (xhigh)'], ['max', 'أقصى (max)']];
+const EFFORT_LEVELS = [['', T('effort.default')], ['none', T('effort.none')], ['minimal', T('effort.minimal')],
+  ['low', T('effort.low')], ['medium', T('effort.medium')], ['high', T('effort.high')], ['xhigh', T('effort.xhigh')], ['max', T('effort.max')]];
 let reasoningModels = new Set();  // models whose name says they can think (from the server)
 let agentEffortPick = {};         // level chosen in the select, kept across re-renders
 function agentEffort(id) {
@@ -3978,10 +3978,10 @@ function agentEffort(id) {
 function effortSelectHtml(id, model, usable) {
   if (!model) return '';
   if (!reasoningModels.has(model))
-    return '<div class="effort-na">🧠 هاد الموديل ما باينش كيدعم مستوى التفكير</div>';
+    return `<div class="effort-na">${T('effort.na')}</div>`;
   const cur = agentEffort(id);
-  return `<label class="effort-row" title="الـ gateway كيبدلو للپاراميتر ديال المزود (reasoning_effort / thinking). إلا المزود رفضو، كيتبعث الطلب بلا بيه.">
-    <span>🧠 التفكير</span>
+  return `<label class="effort-row" title="${escapeHtml(T('effort.title'))}">
+    <span>${T('effort.label')}</span>
     <select id="agentEffort-${id}" ${usable ? '' : 'disabled'} onchange="agentEffortPick['${esc(id)}'] = this.value">
       ${EFFORT_LEVELS.map(([v, t]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${t}</option>`).join('')}
     </select></label>`;
@@ -4312,7 +4312,7 @@ class Handler(BaseHTTPRequestHandler):
         if not getattr(self.server, "lan", False):
             return True
         if not phone.is_private(self.client_address[0]):
-            self._deny(403, "هاد الوصول غير من الشبكة ديال الدار.")
+            self._deny(403, i18n.t("phone.deny_lan"))
             return False
         url = urlparse(self.path)
         query = parse_qs(url.query)
@@ -4330,17 +4330,18 @@ class Handler(BaseHTTPRequestHandler):
             jar = {}
         if phone.token_ok(jar[phone.COOKIE].value if phone.COOKIE in jar else ""):
             return True
-        self._deny(401, "🔒 الرابط تبدل ولا ما صالحش. فالـ PC ضغط على 📱 وسكاني QR من جديد.")
+        self._deny(401, i18n.t("phone.deny_token"))
         return False
 
     def _deny(self, status, message):
         if self.path.startswith(("/api/", "/v1/")):
             return self._json(status, {"error": message})
-        body = (f'<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">'
+        lang = i18n.get_lang()
+        body = (f'<!doctype html><html lang="{lang}" dir="{i18n.direction(lang)}"><meta charset="utf-8">'
                 f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>EskaGate</title>'
                 f'<body style="font-family:system-ui,sans-serif;background:#0f1220;color:#e8eaf6;display:grid;'
                 f'place-items:center;min-height:90vh;margin:0;padding:16px;text-align:center">'
-                f'<p style="font-size:18px;line-height:1.7">{message}</p></body></html>').encode("utf-8")
+                f'<p style="font-size:18px;line-height:1.7">{html.escape(message)}</p></body></html>').encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

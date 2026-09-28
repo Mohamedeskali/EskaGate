@@ -691,7 +691,7 @@ def enable(agent_id, base_url, model, effort=None):
     model, saved = gateway.split_effort(model)
     effort = saved if effort is None else (effort or "")
     if effort and effort not in gateway.EFFORTS:
-        raise ValueError("Unknown thinking level.")
+        raise ValueError(i18n.t("err.unknown_effort"))
     models = visible_models(agent_id)
     if not model:
         raise ValueError(i18n.t("err.pick_model"))

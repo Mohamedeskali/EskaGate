@@ -28,7 +28,7 @@ def load_all():
 def used_keys():
     """Every key the code asks for: page ({{t:..}}, {{h:..}}, T('..')), Python (i18n.t("..")), shell (t key)."""
     keys = set()
-    for name in ("api_web_dashboard_v2.py", "gateway.py", "agents.py", "i18n.py"):
+    for name in ("api_web_dashboard_v2.py", "gateway.py", "agents.py", "alerts.py", "phone.py", "i18n.py"):
         src = (ROOT / name).read_text(encoding="utf-8")
         keys |= set(re.findall(r"\{\{[th]:(\w+\.[\w.]+)\}\}", src))
         keys |= set(re.findall(r"\bT\('(\w+\.[\w.]+)'", src))

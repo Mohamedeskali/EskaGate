@@ -14,6 +14,8 @@ import socket
 import threading
 from http.server import ThreadingHTTPServer
 
+import i18n
+
 COOKIE = "eg_phone"
 
 _lock = threading.Lock()
@@ -73,11 +75,11 @@ def start(handler_cls, port):
         if not _server:
             ip = lan_ip()
             if not ip:
-                raise ValueError("ما لقيتش شبكة محلية (Wi-Fi). تأكد بلي الـ PC متصل بالراوتر.")
+                raise ValueError(i18n.t("phone.err_no_lan"))
             try:
                 server = ThreadingHTTPServer((ip, port), handler_cls)
             except OSError as e:
-                raise ValueError(f"ما قدرتش نفتح {ip}:{port} ({e.strerror or e}).")
+                raise ValueError(i18n.t("phone.err_open", ip=ip, port=port, error=e.strerror or e))
             server.lan = True
             threading.Thread(target=server.serve_forever, daemon=True, name="phone-access").start()
             _server = server

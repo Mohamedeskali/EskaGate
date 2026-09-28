@@ -296,7 +296,11 @@ _QUOTA_HEADERS = {   # bucket: [(limit, remaining, reset), ...] header families 
     "tokens_day": [("x-ratelimit-limit-tokens-day", "x-ratelimit-remaining-tokens-day",
                     "x-ratelimit-reset-tokens-day")],
 }
-QUOTA_LABEL = {"requests": "طلبات", "tokens": "tokens", "requests_day": "طلبات/نهار", "tokens_day": "tokens/نهار"}
+def quota_label(bucket):
+    return {"requests": i18n.t("quota.requests"), "tokens": i18n.t("quota.tokens"),
+            "requests_day": i18n.t("quota.requests_day"), "tokens_day": i18n.t("quota.tokens_day")}.get(bucket, bucket)
+
+
 LOW_QUOTA = 0.10
 
 
@@ -326,7 +330,7 @@ def quota_text(quota):
     def n(v):
         return "?" if v is None else f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.1f}k" if v >= 1e4 else str(v)
     buckets = (quota or {}).get("buckets") or {}
-    return " · ".join(f"{QUOTA_LABEL.get(b, b)} {n(q['remaining'])}/{n(q.get('limit'))}" for b, q in buckets.items())
+    return " · ".join(f"{quota_label(b)} {n(q['remaining'])}/{n(q.get('limit'))}" for b, q in buckets.items())
 
 
 def record_quota(provider, key, quota):
@@ -338,7 +342,7 @@ def record_quota(provider, key, quota):
     for bucket, q in quota.items():
         if q.get("limit") and q["remaining"] < q["limit"] * LOW_QUOTA:
             _emit("quota_low", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
-                  key=mask_key(key["key"]), bucket=QUOTA_LABEL.get(bucket, bucket), remaining=q["remaining"],
+                  key=mask_key(key["key"]), bucket=quota_label(bucket), remaining=q["remaining"],
                   limit=q["limit"], reset=q.get("reset", ""))
 
 
@@ -350,7 +354,7 @@ def switch_active_key(ref):
     with st.lock:
         p = next((p for p in st.providers() if p["id"].lower() == ref or p["name"].lower() == ref), None)
         if not p:
-            raise ValueError("Unknown provider.")
+            raise ValueError(i18n.t("err.unknown_provider"))
         keys, now = p.get("keys", []), time.time()
         cur = p.get("active_key_id")
         idx = next((i for i, k in enumerate(keys) if k["id"] == cur), -1)
@@ -358,7 +362,7 @@ def switch_active_key(ref):
         new = next((k for k in order if k["id"] != cur and k.get("cooldown_until", 0) <= now
                     and k.get("status") != "invalid"), None)
         if not new:
-            raise ValueError("No other available key.")
+            raise ValueError(i18n.t("err.no_other_key"))
         old = next((k for k in keys if k["id"] == cur), None)
         p["active_key_id"] = new["id"]
         st.save()
@@ -374,9 +378,9 @@ def provider_status_lines():
         working = sum(1 for k in keys if k.get("status") == "ok" and k.get("cooldown_until", 0) <= now)
         active = next((k for k in keys if k["id"] == p.get("active_key_id")), None)
         q = quota_text(active.get("quota")) if active else ""
-        lines.append(f"{'⏸ ' if not p.get('enabled', True) else ''}{p['name']}: "
-                     f"{'★ ' + mask_key(active['key']) if active else '★ —'} · {working} خدام · {cooling} كيرتاح"
-                     f" / {len(keys)}" + (f" · 📊 {q}" if q else ""))
+        lines.append(i18n.t("bot.status_line", paused="⏸ " if not p.get("enabled", True) else "", name=p["name"],
+                            active="★ " + mask_key(active["key"]) if active else "★ —", working=working,
+                            cooling=cooling, total=len(keys)) + (f" · 📊 {q}" if q else ""))
     return lines
 
 

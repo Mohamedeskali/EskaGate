@@ -75,7 +75,7 @@ def fill(text, params):
     return re.sub(r"\{(\w+)\}", lambda m: str(params[m.group(1)]) if m.group(1) in params else m.group(0), text)
 
 
-def t(key, lang=None, **params):
+def t(key, lang=None, /, **params):          # positional-only, so "key"/"lang" can be placeholders
     lang = lang if lang in LANGS else get_lang()
     text = load(lang).get(key)
     if text is None:

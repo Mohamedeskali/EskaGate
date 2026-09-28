@@ -143,17 +143,19 @@ To set it up:
 
 1. In Telegram, open **@BotFather**, send `/newbot` and copy the bot token it gives you.
 2. Open your new bot and send it `/start`.
-3. In EskaGate, open **⚙️ Settings**, paste the token under **Telegram alerts** and press **🔎 جيبو** to fill in your chat ID.
-4. Press **💾 حفظ** (save), then **📨 رسالة تجريبية** (test message).
+3. In EskaGate, open **⚙️ Settings**, paste the token under **Telegram alerts** and press **🔎 Find it** (🔎 جيبو in Arabic) to fill in your chat ID.
+4. Press **💾 Save**, then **📨 Test message**.
 
 **Control from Telegram.** Send these to your bot. Only the saved chat ID is answered; other chats are ignored.
 
 - `/status`: one line per provider with the active key (★), how many keys work or are cooling down, and the reported quota.
 - `/switch <provider>`: makes the next available key (not cooling down, not rejected) the active ★ key of that provider, and replies with the result.
 
-**Remaining quota.** After each request the gateway reads the provider's rate-limit headers (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`, `anthropic-ratelimit-*`, `ratelimit-*` and similar). The numbers show on each key in the Providers tab and in the alerts. A provider that never sends them shows "ما مصرحش" (not reported). Nothing is guessed and no extra endpoint is called.
+**Remaining quota.** After each request the gateway reads the provider's rate-limit headers (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`, `anthropic-ratelimit-*`, `ratelimit-*` and similar). The numbers show on each key in the Providers tab and in the alerts. A provider that never sends them shows "not reported". Nothing is guessed and no extra endpoint is called.
 
-**Alert history.** Every alert sent is logged in `~/.api-test-console/alert-history.jsonl` (time, provider, type, message). The Gateway tab shows it under **🔔 سجل التنبيهات**, filterable by provider or agent, type and period, with counts per provider and type (for example how many times a provider ran out of credit this month).
+**Alert history.** Every alert sent is logged in `~/.api-test-console/alert-history.jsonl` (time, provider, type, message). The Gateway tab shows it under **🔔 Alert history**, filterable by provider or agent, type and period, with counts per provider and type (for example how many times a provider ran out of credit this month).
+
+Alerts, the daily summary and the bot's replies are written in the language picked in EskaGate (Arabic, English or French), and follow it as soon as you switch.
 
 The token and chat ID are saved in `~/.api-test-console/telegram.json`, readable only by your user. The page shows them masked. Leave a field empty to keep the saved value. The toggle turns alerts off without deleting the settings.
 
