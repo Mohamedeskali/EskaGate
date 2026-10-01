@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import detect   # noqa: E402  (URL normalization, key format, provider type, genuineness checks)
 import gateway  # noqa: E402  (local AI gateway: providers, local key, /v1 endpoints)
 import i18n     # noqa: E402  (translations: i18n/<lang>.json + the saved UI language)
 import agents   # noqa: E402  (Claude Code / opencode / pi / Hermes config switching)
@@ -53,48 +54,91 @@ class StopStreaming(Exception):
 # ===========================================================================
 # 1) نفس منطق الاختبار الأصلي (ماشي مبدل) — request / retry / probes
 # ===========================================================================
-def make_request(url, headers, payload=None, timeout=15):
+def _parse_body(raw, content_type):
+    try:
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        # Keep a hint of what came back: a web page here usually means a wrong URL, not a bad key.
+        text = raw.decode('utf-8', 'ignore')
+        is_html = 'html' in (content_type or '').lower() or text.lstrip()[:15].lower().startswith(('<!doctype', '<html'))
+        snippet = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', text)).strip()[:160]
+        return {"error": {"message": snippet or f"Empty / non-JSON response ({content_type or 'no content-type'})"},
+                "_not_json": True, "_html": is_html}
+
+
+def make_request_full(url, headers, payload=None, timeout=15):
+    """Like make_request, plus the response headers (quota, Retry-After, anthropic-* checks)."""
     data = json.dumps(payload).encode('utf-8') if payload else None
     req = urllib.request.Request(url, data=data, headers=headers,
                                   method='POST' if payload else 'GET')
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return response.status, json.loads(response.read().decode('utf-8'))
+            hdrs = dict(response.headers.items())
+            return response.status, _parse_body(response.read(), hdrs.get('Content-Type')), hdrs
     except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8')
+        hdrs = dict(e.headers.items()) if e.headers else {}
         try:
-            return e.code, json.loads(body)
+            raw = e.read()
         except Exception:
-            return e.code, {"error": {"message": body}}
+            raw = b''
+        res = _parse_body(raw, hdrs.get('Content-Type'))
+        if not isinstance(res, dict):
+            res = {"error": {"message": str(res)}}
+        return e.code, res, hdrs
     except urllib.error.URLError as e:
-        return 0, {"error": {"message": f"Connection error: {e.reason}"}}
+        return 0, {"error": {"message": f"Connection error: {e.reason}"}}, {}
     except Exception as e:
-        return 0, {"error": {"message": str(e)}}
+        return 0, {"error": {"message": str(e)}}, {}
+
+
+def make_request(url, headers, payload=None, timeout=15):
+    status, res, _ = make_request_full(url, headers, payload, timeout)
+    return status, res
 
 
 def is_timeout(status, res):
     return status == 0 and "timed out" in error_message(res).lower()
 
 
-def timed_request_with_retry(url, headers, payload=None, timeout=15,
-                             max_retries=2, backoff_base=1.5, retry_timeouts=True):
+def _retry_wait(status, hdrs, attempt, backoff_base):
+    """A 429 says how long to wait (Retry-After); honour it, but never sleep long on a check."""
+    if status == 429:
+        try:
+            return max(0.5, min(float(hdrs.get('Retry-After') or hdrs.get('retry-after')), 8.0))
+        except (TypeError, ValueError):
+            return min(2.0 * (attempt + 1), 8.0)
+    return backoff_base ** attempt
+
+
+def timed_request_full(url, headers, payload=None, timeout=15,
+                       max_retries=2, backoff_base=1.5, retry_timeouts=True):
     """
     Same retry policy as before, but also returns the duration of the LAST
     attempt only, so backoff sleeps and failed attempts don't inflate the
-    measured response time.
+    measured response time. Returns (status, res, elapsed, response_headers).
     """
-    status, res, elapsed = 0, {"error": {"message": "Unknown"}}, 0.0
+    status, res, elapsed, hdrs = 0, {"error": {"message": "Unknown"}}, 0.0, {}
     for attempt in range(max_retries + 1):
         start = time.time()
-        status, res = make_request(url, headers, payload, timeout)
+        status, res, hdrs = make_request_full(url, headers, payload, timeout)
         elapsed = time.time() - start
         transient = status == 0 or status == 429 or status >= 500
         # A timeout already cost a full `timeout`; retrying it multiplies the wait.
         if transient and not retry_timeouts and is_timeout(status, res):
             transient = False
+        # "No credit" also comes back as 429 (insufficient_quota): waiting won't fix it.
+        if status == 429 and is_no_credit(res):
+            transient = False
         if not transient or attempt == max_retries:
-            return status, res, elapsed
-        time.sleep(backoff_base ** attempt)
+            return status, res, elapsed, hdrs
+        time.sleep(_retry_wait(status, hdrs, attempt, backoff_base))
+    return status, res, elapsed, hdrs
+
+
+def timed_request_with_retry(url, headers, payload=None, timeout=15,
+                             max_retries=2, backoff_base=1.5, retry_timeouts=True):
+    status, res, elapsed, _ = timed_request_full(url, headers, payload, timeout,
+                                                 max_retries, backoff_base, retry_timeouts)
     return status, res, elapsed
 
 
@@ -224,13 +268,29 @@ def error_message(res):
     return str(err)
 
 
+_AUTH_TEXT = ("invalid api key", "invalid key", "incorrect api key", "invalid x-api-key", "unauthorized",
+              "authentication", "unauthenticated", "api key not valid", "invalid token", "invalid_api_key")
+_CREDIT_TEXT = ("insufficient balance", "insufficient_quota", "insufficient credit", "credit balance",
+                "exceeded your current quota", "billing", "payment required", "out of credit", "no credit",
+                "balance is too low", "not enough credit", "top up")
+_GONE_TEXT = ("model not found", "unknown model", "does not exist", "not available", "deprecated",
+              "decommissioned", "no longer", "not supported model", "invalid model", "model_not_found",
+              "not_found_error", "no endpoints found", "is not a chat model", "not a chat model")
+
+
+def is_no_credit(res):
+    return any(term in error_message(res).lower() for term in _CREDIT_TEXT)
+
+
 def diagnose_failure(code, res):
     """Classify failures so a temporary provider issue is not called a bad model."""
     raw = error_message(res)
     text = raw.lower()
-    if code in (401, 403) or any(term in text for term in ("invalid api key", "invalid key", "unauthorized", "authentication", "forbidden")):
+    if code == 402 or any(term in text for term in _CREDIT_TEXT):
+        return "NO_CREDIT", i18n.t("srv.diag.NO_CREDIT"), raw
+    if code == 401 or (code in (400, 403) and any(term in text for term in _AUTH_TEXT)):
         return "KEY_INVALID", i18n.t("srv.diag.KEY_INVALID"), raw
-    if code == 429 or any(term in text for term in ("rate limit", "too many requests", "quota", "insufficient balance", "credit")):
+    if code == 429 or any(term in text for term in ("rate limit", "rate_limit", "too many requests", "quota")):
         return "LIMITED", i18n.t("srv.diag.LIMITED"), raw
     if code == 0:
         if "timed out" in text or "timeout" in text:
@@ -238,13 +298,27 @@ def diagnose_failure(code, res):
         return "UNAVAILABLE", i18n.t("srv.diag.UNREACHABLE"), raw
     if code >= 500:
         return "UNAVAILABLE", i18n.t("srv.diag.SERVER"), raw
-    if code == 404 or any(term in text for term in ("model not found", "unknown model", "does not exist", "not available")):
+    if code in (404, 405) and isinstance(res, dict) and res.get("_not_json"):
+        # A plain "Not Found" page, not a JSON error about the model: the chat endpoint itself is missing.
+        return "NO_ENDPOINT", i18n.t("srv.diag.NO_ENDPOINT"), raw
+    if code == 403:
+        # The key got through but this model is off-limits (plan, region, org settings).
+        return "DENIED", i18n.t("srv.diag.DENIED"), raw
+    if code == 404 or any(term in text for term in _GONE_TEXT):
         return "MODEL_UNAVAILABLE", i18n.t("srv.diag.MODEL_UNAVAILABLE"), raw
     if code == 400:
         return "INCOMPATIBLE", i18n.t("srv.diag.INCOMPATIBLE"), raw
     if code == 200:
         return "INVALID_RESPONSE", i18n.t("srv.diag.INVALID_RESPONSE"), raw
     return "FAILED", i18n.t("srv.diag.FAILED", code=code), raw
+
+
+# What a model's status means on a key card: verified working, listed but not working,
+# rate limited (unverified), couldn't be judged right now, or the key itself failed.
+VERDICT = {"WORKING": "working", "MODEL_UNAVAILABLE": "broken", "DENIED": "broken", "INCOMPATIBLE": "broken",
+           "INVALID_RESPONSE": "broken", "NO_ENDPOINT": "broken", "FAILED": "broken",
+           "LIMITED": "limited", "NO_CREDIT": "unverified", "UNAVAILABLE": "unverified",
+           "SKIPPED": "unverified", "KEY_INVALID": "key"}
 
 
 def response_has_text(choice):
@@ -263,40 +337,65 @@ def response_has_text(choice):
     return bool(message.get("tool_calls"))
 
 
+def anthropic_has_reply(res):
+    return (isinstance(res, dict) and res.get("type", "message") == "message"
+            and isinstance(res.get("content"), list) and "stop_reason" in res)
+
+
 def test_model(model, chat_url, headers, timeout, max_retries, test_prompt,
-                repeat, check_capabilities):
-    payload = {"model": model, "messages": [{"role": "user", "content": test_prompt}],
-               "max_tokens": 16}
+                repeat, check_capabilities, fmt="openai", max_tokens=16, base_url=""):
+    """One real chat call per run. fmt="anthropic" posts to /v1/messages with x-api-key headers."""
+    if fmt == "anthropic":
+        payload = {"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": test_prompt}]}
+    else:
+        payload = {"model": model, "messages": [{"role": "user", "content": test_prompt}],
+                   "max_tokens": max_tokens}
     times, quality_ok = [], True
-    last_res, last_code = None, 0
+    last_res, last_code, last_headers = None, 0, {}
 
     for _ in range(max(1, repeat)):
         # Only the successful attempt is timed (no retry sleeps included).
-        code, res, elapsed = timed_request_with_retry(chat_url, headers, payload,
+        code, res, elapsed, hdrs = timed_request_full(chat_url, headers, payload,
                                                       timeout=timeout, max_retries=max_retries)
         # Some newer OpenAI-compatible gateways only accept this token field.
-        if code == 400:
+        if code == 400 and fmt != "anthropic" and not is_no_credit(res):
             alternate_payload = dict(payload)
             alternate_payload.pop("max_tokens", None)
-            alternate_payload["max_completion_tokens"] = 16
-            code, res, elapsed = timed_request_with_retry(chat_url, headers, alternate_payload,
+            alternate_payload["max_completion_tokens"] = max_tokens
+            code, res, elapsed, hdrs = timed_request_full(chat_url, headers, alternate_payload,
                                                           timeout=timeout, max_retries=max_retries)
-        last_res, last_code = res, code
+            if code == 200:
+                payload = alternate_payload
+        # A 1-token check can be refused as "too small" by a few providers: ask for a few more tokens.
+        if code == 400 and max_tokens < 16 and "token" in error_message(res).lower() and not is_no_credit(res):
+            payload = dict(payload)
+            payload["max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"] = 16
+            code, res, elapsed, hdrs = timed_request_full(chat_url, headers, payload,
+                                                          timeout=timeout, max_retries=max_retries)
+        last_res, last_code, last_headers = res, code, hdrs
 
-        if code == 200 and isinstance(res, dict) and isinstance(res.get("choices"), list) and res["choices"]:
+        if fmt == "anthropic" and code == 200 and anthropic_has_reply(res):
             times.append(elapsed)
-            quality_ok = quality_ok and response_has_text(res["choices"][0])
+            quality_ok = quality_ok and (bool(res["content"]) or res.get("stop_reason") == "max_tokens")
+        elif fmt != "anthropic" and code == 200 and isinstance(res, dict) and isinstance(res.get("choices"), list) and res["choices"]:
+            times.append(elapsed)
+            # With a 1-token budget an empty answer that stopped on "length" is still a real reply.
+            choice = res["choices"][0]
+            quality_ok = quality_ok and (response_has_text(choice)
+                                         or isinstance(choice, dict) and choice.get("finish_reason") == "length")
         else:
             break
 
     if not times:
         status, message, technical_error = diagnose_failure(last_code, last_res)
-        return {"model": model, "status": status, "code": last_code,
+        if fmt != "anthropic" and status == "KEY_INVALID" and detect.mentions_anthropic_auth(technical_error):
+            message = i18n.t("srv.diag.WANTS_ANTHROPIC")
+        return {"model": model, "status": status, "verdict": VERDICT.get(status, "broken"), "code": last_code,
                 "error": message, "technical_error": technical_error}
 
     avg_time = round(statistics.mean(times), 3)
     result = {
-        "model": model, "status": "WORKING", "code": 200,
+        "model": model, "status": "WORKING", "verdict": "working", "code": 200,
         "response_time_avg": avg_time,
         "response_time_min": round(min(times), 3),
         "response_time_max": round(max(times), 3),
@@ -304,8 +403,9 @@ def test_model(model, chat_url, headers, timeout, max_retries, test_prompt,
         # Real generation speed needs a streamed answer; it is measured by the
         # streaming probe when "capabilities" is enabled, otherwise unknown.
         "tokens_per_sec": None, "ttft": None,
+        "genuine": detect.genuine(fmt, model, last_res, last_headers, base_url or chat_url),
     }
-    if check_capabilities:
+    if check_capabilities and fmt != "anthropic":
         # The three probes are independent: run them together instead of one by one.
         with ThreadPoolExecutor(max_workers=3) as probes:
             f_stream = probes.submit(probe_streaming, model, chat_url, headers, timeout)
@@ -322,14 +422,15 @@ def test_model(model, chat_url, headers, timeout, max_retries, test_prompt,
     return result
 
 
-def build_opencode_config(provider_id, base_url, working_sorted):
+def build_opencode_config(provider_id, base_url, working_sorted, fmt="openai"):
+    anthropic = fmt == "anthropic"
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
             provider_id: {
-                "npm": "@ai-sdk/openai-compatible",
+                "npm": "@ai-sdk/anthropic" if anthropic else "@ai-sdk/openai-compatible",
                 "name": provider_id.capitalize(),
-                "options": {"baseURL": base_url},
+                "options": {"baseURL": detect.anthropic_root(base_url) + "/v1" if anthropic else base_url},
                 "models": {m: {"name": m} for m in working_sorted},
             }
         },
@@ -446,31 +547,152 @@ def guess_provider_id(base_url):
     return labels[0] if labels else "custom_provider"
 
 
+FMT_NAME = {"openai": "OpenAI-compatible", "anthropic": "Anthropic"}
+OTHER_FMT = {"openai": "anthropic", "anthropic": "openai"}
+
+
+def list_models_as(fmt, base_url, api_key, timeout, retries, emit=None):
+    """The model list in one API style (auth header + path). {ok, models, base, code, text, html, ...}."""
+    hdrs = detect.headers(fmt, api_key)
+    candidates = [detect.anthropic_urls(base_url)[0]] if fmt == "anthropic" else model_endpoint_candidates(base_url)
+    out = {"fmt": fmt, "ok": False, "models": [], "base": base_url, "code": 0, "text": "", "html": False, "errors": []}
+    for url in candidates:
+        if emit:
+            emit("status", {"message": i18n.t("srv.trying_list_fmt", url=url, fmt=FMT_NAME[fmt])})
+        models, after, res, status = [], None, {}, 0
+        for _ in range(10):        # Anthropic pages its list (has_more / last_id)
+            page = url + (f"?limit=1000{'&after_id=' + after if after else ''}" if fmt == "anthropic" else "")
+            # Retries still cover 429/5xx and dropped connections, but a timeout is
+            # not retried: a dead host would otherwise cost (retries+1) x timeout.
+            status, res = make_request_with_retry(page, hdrs, timeout=timeout, max_retries=min(max(retries, 1), 3),
+                                                  backoff_base=1.7, retry_timeouts=False)
+            if status != 200:
+                break
+            models += extract_models_from_response(res)
+            if not (fmt == "anthropic" and isinstance(res, dict) and res.get("has_more") and res.get("last_id")):
+                break
+            after = res["last_id"]
+        out.update(code=status, text=error_message(res), html=isinstance(res, dict) and bool(res.get("_html")),
+                   # {"type": "error", "error": {"type": "authentication_error"}}: an Anthropic-style endpoint answered.
+                   anthropic_error=isinstance(res, dict) and res.get("type") == "error" and isinstance(res.get("error"), dict))
+        if models:
+            base = url[:-len("/models")] if fmt == "openai" else base_url
+            out.update(ok=True, code=200, models=list(dict.fromkeys(models)), base=base,
+                       anthropic_list=detect.looks_anthropic_list(res))
+            return out
+        out["errors"].append(i18n.t("srv.list_unreadable", url=url) if status == 200 else f"{url}: HTTP {status} {out['text']}")
+        if status == 0 or status in (401, 403) or out["html"] and status == 200:
+            # Same host and same key for every candidate: the next path would give the same answer.
+            break
+    return out
+
+
+def discover(base_url, api_key, choice, prefer, have_models, timeout, retries, emit):
+    """
+    Which API style does this endpoint speak, and what models does it list?
+    Tries the likely style first (chosen > last detected > URL/key hint), then the other one, so an
+    Anthropic key on an OpenAI-style setup (or the reverse) is reported as such, not as "invalid key".
+    Returns {fmt, base, models, note, fail: (key_status, message) | None, list_error}.
+    """
+    hint, why = detect.format_hint(base_url, api_key)
+    explicit = choice in FMT_NAME
+    first = choice if explicit else (prefer if prefer in FMT_NAME else (hint or "openai"))
+    tried = []
+    for fmt in (first, OTHER_FMT[first]):
+        r = list_models_as(fmt, base_url, api_key, timeout, retries, emit)
+        tried.append(r)
+        if r["ok"]:
+            if explicit and fmt != choice:
+                return {"fmt": fmt, "known_fmt": fmt, "base": r["base"], "models": [], "note": "", "list_error": "",
+                        "fail": ("WRONG_ENDPOINT", i18n.t("srv.wrong_type", chosen=FMT_NAME[choice], works=FMT_NAME[fmt]))}
+            note = i18n.t("srv.switched", first=FMT_NAME[first], fmt=FMT_NAME[fmt]) if fmt != first else ""
+            return {"fmt": fmt, "base": r["base"], "models": r["models"], "note": note, "fail": None, "list_error": "",
+                    "why": why}
+        # Only an auth/path answer can mean "wrong style"; a dead host, a web page, a limit or a
+        # server error would look the same in the other style.
+        if r["code"] not in (400, 401, 403, 404, 405) and not (r["code"] == 200 and not r["html"]):
+            break
+        if r["html"]:
+            break
+
+    r0 = tried[0]
+    list_error = " | ".join(e for r in tried for e in r["errors"]) or r0["text"] or "Unknown error"
+    fmt = choice if explicit else ("anthropic" if detect.mentions_anthropic_auth(r0["text"]) else (hint or first))
+    out = {"fmt": fmt, "base": base_url, "models": [], "note": "", "fail": None, "list_error": list_error, "why": why}
+    codes = [r["code"] for r in tried]
+    if r0["code"] == 0:
+        out["fail"] = ("DOWN", i18n.t("srv.down", error=r0["text"]))
+    elif r0["html"]:
+        out["fail"] = ("WRONG_ENDPOINT", i18n.t("srv.web_page"))
+    elif r0["code"] == 402 or is_no_credit({"error": r0["text"]}):
+        out["fail"] = ("NO_CREDIT", i18n.t("srv.key.NO_CREDIT"))
+    elif api_key.startswith("sk-ant-") and not any(r["fmt"] == "anthropic" and r.get("anthropic_error") for r in tried) \
+            and all(c in (401, 403, 404, 405) for c in codes):
+        # An Anthropic key, and nothing here answered like Anthropic does: the URL is the problem, not the key.
+        out["fail"], out["known_fmt"] = ("WRONG_ENDPOINT", i18n.t("srv.anthropic_key_openai_url")), "openai"
+    elif detect.known_key_name(api_key) not in (None, "Anthropic") and any(
+            r["fmt"] == "anthropic" and r.get("anthropic_error") for r in tried) and all(c in (401, 403, 404, 405) for c in codes):
+        out["fail"] = ("WRONG_ENDPOINT", i18n.t("srv.other_key_anthropic_url", name=detect.known_key_name(api_key)))
+        out["known_fmt"] = "anthropic"
+    elif not have_models:
+        if all(c in (401, 403) for c in codes):
+            out["fail"] = ("INVALID", i18n.t("srv.rejected_both") if len(tried) == 2 else i18n.t("srv.key.INVALID"))
+        elif r0["code"] == 429:
+            out["fail"] = ("LIMITED", i18n.t("srv.key.LIMITED"))
+        elif r0["code"] >= 500:
+            out["fail"] = ("DOWN", i18n.t("srv.down", error=r0["text"]))
+        else:
+            out["fail"] = ("UNCONFIRMED", i18n.t("srv.fetch_failed", error=list_error))
+    return out
+
+
+def key_verdict(results, fmt):
+    """The key's status from real chat calls only: a model list alone never makes a key VALID."""
+    statuses = [r["status"] for r in results]
+    if "WORKING" in statuses:
+        return "VALID"
+    if "KEY_INVALID" in statuses:
+        wants_anthropic = fmt != "anthropic" and any(detect.mentions_anthropic_auth(r.get("technical_error"))
+                                                     for r in results if r["status"] == "KEY_INVALID")
+        return "WRONG_ENDPOINT" if wants_anthropic else "INVALID"
+    if "NO_CREDIT" in statuses:
+        return "NO_CREDIT"
+    tested = [s for s in statuses if s != "SKIPPED"]
+    if tested and all(s == "NO_ENDPOINT" for s in tested):
+        return "WRONG_ENDPOINT"
+    if "LIMITED" in statuses:
+        return "LIMITED"
+    if tested and all(s == "UNAVAILABLE" for s in tested):
+        return "DOWN"
+    return "UNCONFIRMED"
+
+
 def run_pipeline(params, emit):
-    base_url = (params.get("base_url") or "").strip().rstrip('/')
+    raw_url = (params.get("base_url") or "").strip()
     api_key = (params.get("api_key") or "").strip()
 
-    if not base_url or not api_key:
+    if not raw_url or not api_key:
         emit("error", {"message": i18n.t("srv.need_url_key")})
         return
 
-    if not re.match(r"^https?://[^/]+", base_url, re.IGNORECASE):
-        emit("error", {"message": i18n.t("srv.bad_scheme")})
+    # Same rules as the page's preview: scheme, spaces, pasted endpoint paths, doubled /v1.
+    try:
+        base_url = detect.normalize_base_url(raw_url)
+    except ValueError as e:
+        emit("error", {"message": i18n.t("srv.bad_url", error=e), "key_status": "WRONG_ENDPOINT"})
         return
-
-    # Accept a complete chat URL too; internally the dashboard always needs
-    # the API base URL in order to call both /models and /chat/completions.
-    if base_url.lower().endswith("/chat/completions"):
-        base_url = base_url[:-len("/chat/completions")].rstrip('/')
+    if base_url != raw_url.rstrip("/"):
+        emit("status", {"message": i18n.t("srv.url_normalized", url=base_url)})
 
     default_provider = guess_provider_id(base_url)
     provider_id = (params.get("provider_id") or "").strip() or default_provider
 
     try:
         timeout = float(params.get("timeout") or 15)
-        retries = int(params.get("retries") or 2)
+        retries = int(params.get("retries") if params.get("retries") not in (None, "") else 2)
         workers = int(params.get("workers") or 8)
         repeat = int(params.get("repeat") or 1)
+        max_tokens = int(params.get("max_tokens") or 16)
     except (TypeError, ValueError):
         emit("error", {"message": i18n.t("srv.not_numbers")})
         return
@@ -480,36 +702,53 @@ def run_pipeline(params, emit):
         return
     # Prevent an accidental value in the form from exhausting the local machine.
     workers = min(workers, 32)
+    max_tokens = max(1, min(max_tokens, 64))
+    mode = "quick" if params.get("mode") == "quick" else "deep"
+    choice = params.get("format") if params.get("format") in FMT_NAME else "auto"
     check_capabilities = bool(params.get("capabilities"))
     test_prompt = params.get("prompt") or "ping"
     manual_models = params.get("models") or ""
     filter_regex = params.get("filter") or ""
-    fallback_models = params.get("fallback_models") or []
+    fallback_models = [m for m in (params.get("fallback_models") or []) if isinstance(m, str) and m.strip()]
+    prefer_models = [m for m in (params.get("prefer_models") or []) if isinstance(m, str) and m.strip()]
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "API-Test-Console/1.1",
-    }
+    def fail(key_status, message, fmt=None):
+        emit("error", {"message": message, "key_status": key_status, "format": fmt})
 
-    # ---- خطوة 1: جلب الموديلات (بقوة — عدة محاولات وعدة طرق) ----
-    models_list = []
-    if manual_models.strip():
-        models_list = list(dict.fromkeys(m.strip() for m in manual_models.split(",") if m.strip()))
+    # ---- خطوة 0: فحوصات بلا طلب (مفتاح مزور/ناقص، host ميت) ----
+    hint = detect.format_hint(base_url, api_key)[0]
+    problem = detect.key_problem(base_url, api_key)
+    if problem:
+        return fail(*problem, fmt=hint)
+    dead = detect.host_problem(base_url, timeout)
+    if dead:
+        return fail("DOWN", dead, fmt=hint)
+
+    # ---- خطوة 1: نوع الـ API + جلب الموديلات ----
+    models_list = list(dict.fromkeys(m.strip() for m in manual_models.split(",") if m.strip()))
+    if models_list and choice in FMT_NAME:
+        found = {"fmt": choice, "base": base_url, "models": [], "note": "", "fail": None, "list_error": ""}
         emit("status", {"message": i18n.t("srv.manual_models", n=len(models_list))})
     else:
         emit("status", {"message": i18n.t("srv.fetching")})
-        models_list, fetch_err = fetch_models_list(base_url, headers, timeout, retries, emit=emit)
-
+        found = discover(base_url, api_key, choice, params.get("prefer_format"),
+                         bool(models_list or fallback_models or prefer_models), timeout, retries, emit)
+        if found["fail"]:
+            # Only report a type the endpoint itself showed; otherwise the card says "unknown".
+            return fail(*found["fail"], fmt=found.get("known_fmt"))
         if models_list:
+            emit("status", {"message": i18n.t("srv.manual_models", n=len(models_list))})
+        elif found["models"]:
+            models_list = found["models"]
             emit("status", {"message": i18n.t("srv.found", n=len(models_list))})
-        elif fallback_models:
-            models_list = [m for m in fallback_models if isinstance(m, str) and m.strip()]
-            emit("status", {"message": i18n.t("srv.fallback", error=fetch_err, n=len(models_list))})
         else:
-            emit("error", {"message": i18n.t("srv.fetch_failed", error=fetch_err)})
-            return
+            models_list = list(dict.fromkeys(prefer_models + fallback_models))
+            emit("status", {"message": i18n.t("srv.fallback", error=found["list_error"], n=len(models_list))})
+    fmt, api_base = found["fmt"], found["base"]
+    emit("detected", {"format": fmt, "name": FMT_NAME[fmt], "base_url": api_base, "note": found["note"],
+                      "why": found.get("why") or ""})
+    if found["note"]:
+        emit("status", {"message": found["note"]})
 
     if filter_regex:
         try:
@@ -525,67 +764,120 @@ def run_pipeline(params, emit):
         emit("error", {"message": i18n.t("srv.no_models")})
         return
 
-    emit("models_found", {"count": len(models_list), "models": models_list})
+    emit("models_found", {"count": len(models_list), "models": models_list, "mode": mode})
 
-    # ---- خطوة 2: اختبار متوازي، كل نتيجة كتبعث فالحين ----
-    chat_url = f"{base_url}/chat/completions"
+    # ---- خطوة 2: طلب حقيقي واحد على أرخص موديل باش نتأكدو من المفتاح ----
+    headers = detect.headers(fmt, api_key)
+    chat_url = detect.anthropic_urls(api_base)[1] if fmt == "anthropic" else f"{api_base}/chat/completions"
     t0 = time.time()
     results = []
 
-    executor = ThreadPoolExecutor(max_workers=min(workers, len(models_list)))
-    futures = {
-        executor.submit(test_model, m, chat_url, headers, timeout, retries,
-                         test_prompt, repeat, check_capabilities): m
-        for m in models_list
-    }
-    try:
-        for future in as_completed(futures):
-            model = futures[future]
-            try:
+    def check(model):
+        try:
+            return test_model(model, chat_url, headers, timeout, retries, test_prompt, repeat,
+                              check_capabilities, fmt=fmt, max_tokens=max_tokens, base_url=api_base)
+        except Exception as e:
+            # A bad provider response for one model must not abort the full batch.
+            return {"model": model, "status": "FAILED", "verdict": "broken", "code": 0,
+                    "error": i18n.t("srv.model_crash"), "technical_error": str(e)}
+
+    preferred = [m for m in prefer_models if m in models_list]
+    order = preferred + [m for m in detect.cheap_order(models_list) if m not in preferred]
+    probes = [m for m in order if detect.is_chat_model(m)][:3] or order[:1]
+    key_failed = False
+    for model in probes:
+        emit("status", {"message": i18n.t("srv.probing", model=model)})
+        r = check(model)
+        results.append(r)
+        emit("model_result", r)
+        if r["status"] == "WORKING":
+            break
+        if r["status"] in ("KEY_INVALID", "NO_CREDIT"):
+            key_failed = True
+            break
+
+    # ---- خطوة 3 (فحص عميق): كل موديل بطلب حقيقي، بالتوازي، كل نتيجة كتبعث فالحين ----
+    tested = {r["model"] for r in results}
+    rest = [m for m in models_list if m not in tested]
+    if mode == "deep" and rest and key_failed:
+        for m in rest:
+            emit("model_result", {"model": m, "status": "SKIPPED", "verdict": "unverified", "code": 0,
+                                  "error": i18n.t("srv.skipped_key")})
+    elif mode == "deep" and rest:
+        executor = ThreadPoolExecutor(max_workers=min(workers, len(rest)))
+        futures = {executor.submit(check, m): m for m in rest}
+        emitted = set()
+        try:
+            for future in as_completed(futures):
                 r = future.result()
-            except Exception as e:
-                # A bad provider response for one model must not abort the full batch.
-                r = {"model": model, "status": "FAILED", "code": 0,
-                     "error": i18n.t("srv.model_crash"),
-                     "technical_error": str(e)}
-            results.append(r)
-            emit("model_result", r)  # <-- كتبعث لصفحة الويب فالحين، بلا ما تسنى الباقي
-    except StopStreaming:
-        # The page was closed or the user pressed "stop": drop the models that
-        # haven't started yet instead of spending API calls nobody will see.
+                results.append(r)
+                emitted.add(r["model"])
+                emit("model_result", r)  # <-- كتبعث لصفحة الويب فالحين، بلا ما تسنى الباقي
+                done = [x["status"] for x in results]
+                # Several key-level refusals and nothing working: the key is the problem, stop spending.
+                if "WORKING" not in done and sum(s in ("KEY_INVALID", "NO_CREDIT") for s in done) >= 3:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    for m in rest:
+                        if m not in emitted:
+                            emit("model_result", {"model": m, "status": "SKIPPED", "verdict": "unverified",
+                                                  "code": 0, "error": i18n.t("srv.skipped_key")})
+                    break
+        except StopStreaming:
+            # The page was closed or the user pressed "stop": drop the models that
+            # haven't started yet instead of spending API calls nobody will see.
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
         executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    executor.shutdown(wait=True)
 
     total_time = round(time.time() - t0, 2)
     working = sorted([r for r in results if r["status"] == "WORKING"],
                       key=lambda r: r["response_time_avg"])
     failed = [r for r in results if r["status"] != "WORKING"]
     working_sorted = [r["model"] for r in working]
+    key_status = key_verdict(results, fmt)
+    key_message = i18n.t("srv.key." + key_status)
+    if key_status == "WRONG_ENDPOINT" and any(r["status"] == "KEY_INVALID" for r in results):
+        key_message = i18n.t("srv.diag.WANTS_ANTHROPIC")
+    counts = {v: sum(r.get("verdict") == v for r in results) for v in ("working", "broken", "limited", "unverified")}
 
-    if working:
-        key_status = "VALID"
-        key_message = i18n.t("srv.key.VALID")
-    elif any(r["status"] == "KEY_INVALID" for r in failed):
-        key_status = "INVALID"
-        key_message = i18n.t("srv.key.INVALID")
-    elif any(r["status"] == "LIMITED" for r in failed):
-        key_status = "LIMITED"
-        key_message = i18n.t("srv.key.LIMITED")
-    else:
-        key_status = "UNCONFIRMED"
-        key_message = i18n.t("srv.key.UNCONFIRMED")
-
-    config_data = build_opencode_config(provider_id, base_url, working_sorted) if working_sorted else None
+    config_data = build_opencode_config(provider_id, api_base, working_sorted, fmt) if working_sorted else None
 
     emit("summary", {
-        "base_url": base_url, "provider_id": provider_id,
-        "total_time_seconds": total_time,
-        "total": len(models_list), "working": len(working), "failed": len(failed),
+        "base_url": api_base, "provider_id": provider_id,
+        "total_time_seconds": total_time, "mode": mode,
+        "format": fmt, "format_name": FMT_NAME[fmt], "format_note": found["note"],
+        "total": len(models_list) if mode == "deep" else len(results),
+        "listed": len(models_list), "counts": counts,
+        "working": len(working), "failed": len(failed),
         "key_status": key_status, "key_message": key_message,
         "config": config_data,
     })
     emit("done", {})
+
+
+def quick_key_check(base_url, api_key, fmt, prefer_models=(), timeout=20):
+    """Gateway "test keys": the same pipeline in quick mode (list + one real 1-token call), collected."""
+    out = {"key_status": "UNCONFIRMED", "message": "", "models": [], "tested_model": None, "time": None}
+
+    def emit(kind, data):
+        if kind == "error":
+            out.update(key_status=data.get("key_status") or "UNCONFIRMED", message=data["message"])
+        elif kind == "models_found":
+            out["models"] = data["models"]
+        elif kind == "model_result":
+            out["tested_model"] = data["model"]
+            out["time"] = data.get("response_time_avg")
+            if data["status"] != "WORKING":
+                out["message"] = data.get("error") or ""
+        elif kind == "summary":
+            out["key_status"] = data["key_status"]
+            if data["key_status"] == "VALID":
+                out["message"] = ""
+            elif not out["message"]:
+                out["message"] = data["key_message"]
+    run_pipeline({"base_url": base_url, "api_key": api_key, "format": fmt, "mode": "quick", "max_tokens": 1,
+                  "timeout": timeout, "retries": 1, "prefer_models": list(prefer_models)}, emit)
+    return out
 
 
 # ===========================================================================
@@ -1553,6 +1845,30 @@ INDEX_HTML = r"""
   .to-top.show { opacity: 1; transform: none; pointer-events: auto; }
   .to-top:hover { border-color: var(--accent); color: var(--accent); }
   .kc-error { color: var(--bad); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+  /* key/model detection: provider type, key status, per-model groups and "is it genuine" badges */
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .fmt-chip { display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 10.5px; font-weight: 750;
+    background: var(--surface-3); color: var(--muted); border: 1px solid var(--line); }
+  .fmt-chip.anthropic { color: var(--accent-2); border-color: var(--accent-2); }
+  .fmt-chip.openai { color: var(--accent); border-color: var(--accent); }
+  .kc-note { font-size: 11.5px; color: var(--warn); margin-top: 6px; overflow-wrap: anywhere; }
+  .kc-progress { margin: 2px 0 8px; font-size: 11.5px; color: var(--muted); }
+  .kc-progress .track { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; margin-top: 4px; }
+  .kc-progress .fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .3s ease; }
+  .kc-group { margin-top: 6px; font-size: 11.5px; }
+  .kc-group > summary { cursor: pointer; font-weight: 700; color: var(--muted); padding: 2px 0; }
+  .kc-group.broken > summary { color: var(--bad); } .kc-group.limited > summary { color: var(--warn); }
+  .kc-group .model-tags { margin-top: 5px; }
+  .kc-group.broken .model-tag { border-color: var(--bad-soft); text-decoration: line-through; text-decoration-color: var(--bad); }
+  .kc-group.limited .model-tag { border-color: var(--warn-soft); }
+  .gen { font-size: 10px; font-weight: 800; margin-inline-start: 4px; }
+  .gen.verified { color: var(--ok); } .gen.suspicious { color: var(--bad); } .gen.unknown { color: var(--faint); }
+  .model-cell .gen { white-space: nowrap; }
+  .url-preview { margin-top: 5px; font-size: 11.5px; color: var(--faint); font-family: var(--font-mono); overflow-wrap: anywhere;
+    cursor: pointer; text-align: start; }
+  .url-preview:hover .u { color: var(--accent); }
+  .url-preview.bad { color: var(--bad); cursor: default; font-family: inherit; }
+  .url-preview .t { font-family: var(--font-ui); color: var(--muted); }
   .kcard-foot { display: flex; align-items: center; gap: 6px; padding: 10px 16px; border-top: 1px solid var(--line-soft); margin-top: auto;
     background: var(--surface-2); border-radius: 0 0 var(--radius) var(--radius); flex-wrap: wrap; }
   .kcard-foot .spacer { flex: 1; }
@@ -1755,6 +2071,7 @@ INDEX_HTML = r"""
               <button type="button" class="btn-icon" title="{{t:common.paste}}" onclick="pasteInto('base_url')">📥</button>
               <button type="button" class="btn-icon" title="{{t:common.copy}}" onclick="copyField('base_url', this)">📋</button>
             </div>
+            <div class="url-preview" id="base_url_preview" dir="ltr" hidden></div>
           </div>
           <div class="field">
             <label>API Key</label>
@@ -1764,6 +2081,14 @@ INDEX_HTML = r"""
               <button type="button" class="btn-icon" title="{{t:common.paste}}" onclick="pasteInto('api_key')">📥</button>
               <button type="button" class="btn-icon" title="{{t:common.copy}}" onclick="copyField('api_key', this)">📋</button>
             </div>
+          </div>
+          <div class="field">
+            <label>{{t:test.api_type}}</label>
+            <select id="api_format" onchange="updateUrlPreview('base_url')">
+              <option value="auto">{{t:test.api_auto}}</option>
+              <option value="openai">OpenAI-compatible (/chat/completions)</option>
+              <option value="anthropic">Anthropic (/v1/messages)</option>
+            </select>
           </div>
           <div class="field">
             <label>{{t:test.provider_id}}</label>
@@ -1847,6 +2172,7 @@ INDEX_HTML = r"""
               <button class="chip on" data-filter="all" onclick="setResultFilter('all')">{{t:common.all}}<span class="n" id="fcAll">0</span></button>
               <button class="chip" data-filter="ok" onclick="setResultFilter('ok')">{{t:common.ok_filter}}<span class="n" id="fcOk">0</span></button>
               <button class="chip" data-filter="bad" onclick="setResultFilter('bad')">{{t:test.f_bad}}<span class="n" id="fcBad">0</span></button>
+              <button class="chip" data-filter="warn" onclick="setResultFilter('warn')">{{t:test.f_unverified}}<span class="n" id="fcWarn">0</span></button>
               <input class="search-input" id="resultSearch" dir="ltr" placeholder="{{t:test.search_ph}}" oninput="applyResultFilter()">
             </div>
           </div>
@@ -1939,7 +2265,8 @@ INDEX_HTML = r"""
             <button class="ghost sm" id="provFormCancel" style="width:auto; display:none;" onclick="resetProviderForm()">{{t:common.cancel}}</button></div>
           <input type="hidden" id="prov_id">
           <div class="field"><label>{{t:prov.name_label}}</label><input id="prov_name" dir="ltr" placeholder="openrouter"></div>
-          <div class="field"><label>Base URL</label><input id="prov_base" dir="ltr" placeholder="https://api.example.com/v1"></div>
+          <div class="field"><label>Base URL</label><input id="prov_base" dir="ltr" placeholder="https://api.example.com/v1">
+            <div class="url-preview" id="prov_base_preview" dir="ltr" hidden></div></div>
           <div class="field"><label>{{t:prov.format_label}}</label>
             <select id="prov_format">
               <option value="openai">OpenAI-compatible (/chat/completions)</option>
@@ -2441,9 +2768,99 @@ function refreshProfileSelect(selectName) {
   if (selectName) sel.value = selectName;
 }
 
+/* =========================================================================
+   BASE URL — same rules as detect.normalize_base_url() on the server, shown as a preview
+   (click it to apply) and applied on run/save, so nothing is rewritten silently.
+   ========================================================================= */
+const FMT_LABEL = { openai: 'OpenAI-compatible', anthropic: 'Anthropic' };
+/*norm-start*/
+const ENDPOINT_SUFFIXES = ['/chat/completions', '/completions', '/responses', '/messages/count_tokens', '/messages', '/models', '/embeddings'];
+function isLocalHost(h) {
+  h = h.replace(/^\[|\]$/g, '').toLowerCase();
+  if (h === 'localhost' || /\.(localhost|local|lan|internal|home\.arpa)$/.test(h)) return true;
+  const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) { const a = +m[1], b = +m[2]; return a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254); }
+  if (h.includes(':')) return h === '::1' || h === '::' || /^f[cd]|^fe80/.test(h);
+  return !h.includes('.');
+}
+function normalizeBaseUrl(raw) {
+  const bad = () => new Error(T('url.bad_host'));
+  let s = String(raw || '').replace(/\s+/g, '').replace(/^["'<>`]+|["'<>`]+$/g, '');
+  if (!s) return '';
+  let scheme = null, rest;
+  const m = s.match(/^([a-z][a-z0-9+.-]*):\/*/i);
+  if (m && /^https?$/i.test(m[1])) { scheme = m[1].toLowerCase(); rest = s.slice(m[0].length); }
+  else if (m && s.slice(0, m[0].length + 1).includes('://')) throw new Error(T('url.bad_scheme', { scheme: m[1] }));
+  else rest = s.replace(/^\/+/, '');
+  const cut = rest.search(/[\/?#]/);
+  let netloc = (cut < 0 ? rest : rest.slice(0, cut)).replace(/^.*@/, '');
+  let path = (cut < 0 ? '' : rest.slice(cut)).replace(/[?#].*$/, '');
+  let host = netloc, port = null;
+  const v6 = netloc.match(/^\[([^\]]+)\](?::(\d*))?$/);
+  const i = netloc.lastIndexOf(':');
+  if (v6) { host = v6[1]; port = v6[2] ? +v6[2] : null; }
+  else if (i >= 0) {
+    host = netloc.slice(0, i); const ps = netloc.slice(i + 1);
+    if (ps !== '') { if (!/^\d+$/.test(ps) || +ps > 65535) throw bad(); port = +ps; }
+  }
+  host = host.toLowerCase();
+  if (!host || !/^([a-z0-9.\-_]+|[0-9a-f:]+)$/.test(host) || host.startsWith('.') || host.includes('..')) throw bad();
+  if (!(host === 'localhost' || host.includes('.') || host.includes(':') || port)) throw bad();
+  if (!scheme) scheme = port === 80 || (port !== 443 && isLocalHost(host)) ? 'http' : 'https';
+  const net = (host.includes(':') ? `[${host}]` : host) + (port ? ':' + port : '');
+  path = path.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  for (let changed = true; changed && path;) {
+    changed = false;
+    for (const suf of ENDPOINT_SUFFIXES) {
+      if (path.toLowerCase().endsWith(suf)) { path = path.slice(0, -suf.length).replace(/\/+$/, ''); changed = true; }
+    }
+  }
+  path = path.replace(/(\/v\d+(?:alpha|beta)?\d*)(\1)+(?=\/|$)/gi, '$1');
+  return `${scheme}://${net}${path}`;
+}
+/*norm-end*/
+// A hint only (the server decides by asking the endpoint): Anthropic's host, an /anthropic path or an sk-ant- key.
+function guessFormat(url, key) {
+  let host = '', path = '';
+  try { const u = new URL(url); host = u.hostname; path = u.pathname.toLowerCase(); } catch (e) { return null; }
+  if (/(^|\.)anthropic\.com$/.test(host) || /\/anthropic(\/|$)/.test(path) || host.includes('claude') || /^sk-ant-/.test(key || '')) return 'anthropic';
+  return null;
+}
+function updateUrlPreview(id) {
+  const input = document.getElementById(id), box = document.getElementById(id + '_preview');
+  if (!input || !box) return;
+  const raw = input.value.trim();
+  box.onclick = null;
+  if (!raw) { box.hidden = true; return; }
+  let url;
+  try { url = normalizeBaseUrl(raw); }
+  catch (e) { box.hidden = false; box.className = 'url-preview bad'; box.textContent = '⚠ ' + e.message; return; }
+  const tester = id === 'base_url';
+  const picked = document.getElementById(tester ? 'api_format' : 'prov_format').value;
+  const guess = guessFormat(url, tester ? document.getElementById('api_key').value.trim() : '');
+  const showGuess = guess && (tester ? picked === 'auto' : picked !== guess);
+  const changed = url !== raw.replace(/\/+$/, '');
+  if (!changed && !showGuess) { box.hidden = true; return; }
+  box.hidden = false; box.className = 'url-preview';
+  box.title = changed ? T('url.click_apply') : '';
+  box.innerHTML = (changed ? `→ <span class="u">${escapeHtml(url)}</span>` : '')
+    + (showGuess ? ` <bdi class="t" dir="auto">· ${escapeHtml(T('url.looks', { type: FMT_LABEL[guess] }))}</bdi>` : '');
+  if (changed) box.onclick = () => { input.value = url; input.dispatchEvent(new Event('input')); };
+}
+// Run/save use the normalized URL and put it in the field, so what is saved is what was shown.
+function takeNormalizedUrl(id) {
+  const input = document.getElementById(id);
+  try {
+    const url = normalizeBaseUrl(input.value);
+    if (url && url !== input.value) { input.value = url; updateUrlPreview(id); }
+    return url;
+  } catch (e) { toast(T('url.invalid'), 'bad', e.message); input.focus(); return null; }
+}
+
 function currentFormValues() {
   return {
     base_url: document.getElementById('base_url').value,
+    format: document.getElementById('api_format').value,
     api_key: document.getElementById('api_key').value,
     provider_id: document.getElementById('provider_id').value,
     models: document.getElementById('models').value,
@@ -2459,6 +2876,7 @@ function currentFormValues() {
 
 function saveProfile() {
   if (testerKeyRef) { toast(T('profile.provider_key'), 'warn'); return; }
+  if (takeNormalizedUrl('base_url') === null) return;
   const values = currentFormValues();
   if (!values.base_url || !values.api_key) {
     toast(T('profile.fill_first'), 'bad'); return;
@@ -2486,6 +2904,8 @@ function applyProfile() {
   if (!profile) return;
   document.getElementById('base_url').value = profile.base_url || '';
   document.getElementById('api_key').value = profile.api_key || '';
+  document.getElementById('api_format').value = FMT_LABEL[profile.format] ? profile.format : 'auto';
+  updateUrlPreview('base_url');
   document.getElementById('provider_id').value = profile.provider_id || '';
   document.getElementById('models').value = profile.models || '';
   document.getElementById('filter').value = profile.filter || '';
@@ -2577,6 +2997,8 @@ function clearAllFields() {
   document.getElementById('workers').value = 8;
   document.getElementById('repeat').value = 1;
   document.getElementById('capabilities').checked = false;
+  document.getElementById('api_format').value = 'auto';
+  document.getElementById('base_url_preview').hidden = true;
   document.getElementById('savedProfiles').value = '';
   updateAdvancedNote();
   setStatus(T('test.cleared'));
@@ -2610,15 +3032,63 @@ function timeAgo(ts) {
 }
 function normalizeWorkingEntry(w) { return (typeof w === 'string') ? { model: w, time: null } : w; }
 
+const KS_PILL = { INVALID: 'bad', WRONG_ENDPOINT: 'bad', NO_CREDIT: 'bad', LIMITED: 'warn', DOWN: 'warn', UNCONFIRMED: 'warn' };
 function statusBadge(p) {
-  if (p.checking) return `<span class="pill pending">${T('badge.checking')}</span>`;
+  if (p.checking) {
+    const live = liveChecks[p.name];
+    return `<span class="pill pending">${live && live.mode === 'deep' ? T('badge.deep_checking') : T('badge.checking')}</span>`;
+  }
   if (!p.lastCheck) return `<span class="pill pending">${T('time.never')}</span>`;
+  const ks = p.lastCheck.keyStatus;
+  if (ks && ks !== 'VALID') return `<span class="pill ${KS_PILL[ks] || 'bad'}">${T('ks.' + ks)}</span>`;
   if (!p.lastCheck.keyValid) return `<span class="pill bad">${T('badge.key_down')}</span>`;
   if (!p.lastCheck.working || p.lastCheck.working.length === 0)
     return `<span class="pill bad">${T('badge.none_working')}</span>`;
   const changed = (p.lastCheck.added.length || p.lastCheck.removed.length) && p.lastCheck.hadPrevious;
   if (changed) return `<span class="pill pending">${T('badge.changed')}</span>`;
   return `<span class="pill ok">${T('badge.all_ok')}</span>`;
+}
+function fmtChip(lc) {
+  const f = lc && lc.format;
+  return `<span class="fmt-chip ${f && FMT_LABEL[f] ? f : ''}" title="${escapeHtml(T('keys.type_title'))}">${f && FMT_LABEL[f] ? FMT_LABEL[f] : T('fmt.unknown')}</span>`;
+}
+// Live progress while a check runs; the last known results stay visible below it.
+function progressHtml(name) {
+  const live = liveChecks[name];
+  if (!live) return '';
+  const pct = live.total ? Math.round(live.done / live.total * 100) : 0;
+  const c = live.counts;
+  return `<div class="kc-progress">${T(live.mode === 'deep' ? 'keys.deep_progress' : 'keys.quick_progress', { done: live.done, total: live.total || '…' })}
+    · ✅ ${c.working} · ⛔ ${c.broken} · ⏳ ${c.limited + c.unverified}
+    <div class="track"><div class="fill" style="width:${pct}%"></div></div></div>`;
+}
+// The other model groups of a card: listed but not working, rate limited / unverified, not checked yet.
+function modelGroups(p) {
+  const map = p.lastCheck && p.lastCheck.models;
+  if (!map) return '';
+  const groups = { broken: [], limited: [], listed: [] };
+  for (const [m, v] of Object.entries(map)) {
+    if (v.state === 'broken') groups.broken.push([m, v]);
+    else if (v.state === 'limited' || v.state === 'unverified') groups.limited.push([m, v]);
+    else if (v.state === 'listed') groups.listed.push([m, v]);
+  }
+  const icons = { broken: '⛔', limited: '⏳', listed: '📋' };
+  return Object.entries(groups).filter(([, list]) => list.length).map(([g, list]) => {
+    const shown = list.slice(0, 200);
+    const tags = shown.map(([m, v]) => `<span class="model-tag" data-m="${escapeHtml(m.toLowerCase())}" title="${escapeHtml([v.error, v.status].filter(Boolean).join(' · '))}">${escapeHtml(m)}</span>`).join('')
+      + (list.length > shown.length ? `<span class="model-tag">+${list.length - shown.length}</span>` : '');
+    return `<details class="kc-group ${g}"><summary>${icons[g]} ${T('group.' + g, { n: list.length })}</summary>
+      <div class="model-tags${list.length > 24 ? ' models-scroll' : ''}">${tags}</div></details>`;
+  }).join('');
+}
+function profileState(p) {
+  if (p.checking) return 'idle';
+  if (!p.lastCheck) return 'idle';
+  const ks = p.lastCheck.keyStatus;
+  if (ks && ks !== 'VALID') return KS_PILL[ks] === 'warn' ? 'warn' : 'bad';
+  if (!p.lastCheck.keyValid || !p.lastCheck.working || !p.lastCheck.working.length) return 'bad';
+  if (p.lastCheck.hadPrevious && (p.lastCheck.added.length || p.lastCheck.removed.length)) return 'warn';
+  return 'ok';
 }
 
 // Long lists (a key can have thousands of models): a card shows the fastest few,
@@ -2630,7 +3100,7 @@ function modelTags(list, key) {
   if (!list || list.length === 0) return '<span style="color:var(--faint);">—</span>';
   const sorted = list.map(normalizeWorkingEntry).sort((a,b) => (a.time ?? Infinity) - (b.time ?? Infinity));
   const tag = (w, i) =>
-    `<span class="model-tag" data-m="${escapeHtml(String(w.model).toLowerCase())}">${i+1}. ${escapeHtml(w.model)}${w.time != null ? ` <span class="t">· ${w.time}s</span>` : ''}</span>`;
+    `<span class="model-tag" data-m="${escapeHtml(String(w.model).toLowerCase())}">${i+1}. ${escapeHtml(w.model)}${w.time != null ? ` <span class="t">· ${w.time}s</span>` : ''}${genuineBadge(w.gen, true)}</span>`;
   if (key == null || sorted.length <= MODELS_PREVIEW) return `<div class="model-tags">${sorted.map(tag).join('')}</div>`;
   if (!modelsOpen.has(key)) {
     return `<div class="model-tags">${sorted.slice(0, MODELS_PREVIEW).map(tag).join('')}</div>
@@ -2671,13 +3141,6 @@ function diffLine(p) {
    ARCHIVE (grid of key-cards)
    ========================================================================= */
 let keyFilter = 'all';
-function profileState(p) {
-  if (p.checking) return 'idle';
-  if (!p.lastCheck) return 'idle';
-  if (!p.lastCheck.keyValid || !p.lastCheck.working || !p.lastCheck.working.length) return 'bad';
-  if (p.lastCheck.hadPrevious && (p.lastCheck.added.length || p.lastCheck.removed.length)) return 'warn';
-  return 'ok';
-}
 function setKeyFilter(f) {
   keyFilter = f;
   document.querySelectorAll('[data-kf]').forEach(c => c.classList.toggle('on', c.dataset.kf === f));
@@ -2719,7 +3182,8 @@ function renderArchive() {
   const cards = profiles.map((p, i) => ({ p, i, st: profileState(p) }))
     .filter(({ p, st }) => (keyFilter === 'all' || st === keyFilter)
       && (!q || (p.name || '').toLowerCase().includes(q) || (p.base_url || '').toLowerCase().includes(q) || (p.source || '').toLowerCase().includes(q)
-        || ((p.lastCheck && p.lastCheck.working) || []).some(w => String(normalizeWorkingEntry(w).model).toLowerCase().includes(q))))
+        || ((p.lastCheck && p.lastCheck.working) || []).some(w => String(normalizeWorkingEntry(w).model).toLowerCase().includes(q))
+        || Object.keys((p.lastCheck && p.lastCheck.models) || {}).some(m => m.toLowerCase().includes(q))))
     .map(({ p, i, st }) => {
       const workingCount = p.lastCheck && p.lastCheck.working ? p.lastCheck.working.length : 0;
       const canCopy = !!(p.lastCheck && p.lastCheck.config);
@@ -2728,6 +3192,10 @@ function renderArchive() {
         `<button class="dd-item" ${hasWorking ? '' : 'disabled'} onclick="copyCustomFormat('${esc(p.name)}', '${esc(f.name)}', 'copybtn-${i}')"><span class="em">🧩</span> ${escapeHtml(f.name)}</button>`).join('');
       const err = p.lastCheck && !p.lastCheck.keyValid && p.lastCheck.errorMessage
         ? `<div class="kc-error">${escapeHtml(p.lastCheck.errorMessage)}</div>` : '';
+      const note = p.lastCheck && p.lastCheck.formatNote ? `<div class="kc-note">🔀 ${escapeHtml(p.lastCheck.formatNote)}</div>` : '';
+      // Only worth it when the key works and some listed models were never tried one by one.
+      const deepHint = p.lastCheck && p.lastCheck.keyValid && Object.values(p.lastCheck.models || {}).some(v => v.state === 'listed')
+        ? `<div class="kc-note">${T('keys.deep_hint')}</div>` : '';
       return `
       <div class="kcard ${st}">
         <div class="kcard-head">
@@ -2736,7 +3204,7 @@ function renderArchive() {
             <div class="kc-name">${sourceUrl(p.source)
               ? `<a class="kc-link" href="${escapeHtml(sourceUrl(p.source))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(T('keys.open_url', { url: sourceUrl(p.source) }))}">${escapeHtml(p.name)} <span class="ext">↗</span></a>`
               : `<span title="${escapeHtml(T('keys.link_hint'))}">${escapeHtml(p.name)}</span>`}</div>
-            <div class="kc-sub">⏱ ${timeAgo(p.lastCheck && p.lastCheck.timestamp)} · ${T('keys.working_count', { n: workingCount })}</div>
+            <div class="kc-sub">⏱ ${timeAgo(p.lastCheck && p.lastCheck.timestamp)} · ${T('keys.working_count', { n: workingCount })} · ${fmtChip(p.lastCheck)}</div>
           </div>
           ${statusBadge(p)}
         </div>
@@ -2751,10 +3219,12 @@ function renderArchive() {
           <div class="kv-row"><span class="k">${T('keys.lbl_source')}</span>
             <input value="${esc(p.source)}" placeholder="${escapeHtml(T('keys.source_ph'))}" onchange="updateSource('${esc(p.name)}', this.value)"></div>
           <div class="kc-models-block">
+            ${progressHtml(p.name)}
             <div class="lbl">${T('keys.models_label')}</div>
             ${modelTags(p.lastCheck && p.lastCheck.working, p.name)}
+            ${modelGroups(p)}
             ${diffLine(p)}
-            ${err}
+            ${err}${note}${deepHint}
           </div>
         </div>
         <div class="kcard-foot">
@@ -2771,7 +3241,8 @@ function renderArchive() {
           </div>
           <span class="spacer"></span>
           <button class="icon-act" title="${escapeHtml(T('keys.open_tester'))}" onclick="loadFromArchive('${esc(p.name)}')">⬆</button>
-          <button class="icon-act" title="${escapeHtml(T('keys.check_now'))}" onclick="checkProfileNow('${esc(p.name)}')">🔄</button>
+          <button class="icon-act" title="${escapeHtml(T('keys.check_now'))}" onclick="checkProfileNow('${esc(p.name)}', 'quick')">🔄</button>
+          <button class="icon-act" title="${escapeHtml(T('keys.deep_check'))}" onclick="checkProfileNow('${esc(p.name)}', 'deep')">🔬</button>
           <button class="icon-act" title="${escapeHtml(T('keys.to_gw'))}" onclick="sendProfileToGateway('${esc(p.name)}')">🚪</button>
           <button class="icon-act danger" title="${escapeHtml(T('common.delete'))}" onclick="deleteFromArchive('${esc(p.name)}')">🗑</button>
         </div>
@@ -2869,16 +3340,26 @@ document.addEventListener('click', () => {
 /* =========================================================================
    PROFILE CHECK (live) — same logic as before
    ========================================================================= */
-async function runProfileCheck(profile) {
-  const knownWorking = ((profile.lastCheck && profile.lastCheck.working) || [])
-    .map(normalizeWorkingEntry).map(w => w.model);
+// mode 'quick' (🔄, "check all", the monitor): model list + one real 1-token call on a cheap model.
+// mode 'deep' (🔬): one real 1-token call per listed model, in parallel. Results stream in live.
+const liveChecks = {};   // key name -> { mode, done, total, counts } while a check runs
+let archiveTimer = null;
+function renderArchiveSoon() {
+  if (!archiveTimer) archiveTimer = setTimeout(() => { archiveTimer = null; renderArchive(); }, 250);
+}
+async function runProfileCheck(profile, mode) {
+  const last = profile.lastCheck || {};
+  const knownWorking = (last.working || []).map(normalizeWorkingEntry).map(w => w.model);
   const payload = {
     base_url: profile.base_url, api_key: profile.api_key, provider_id: profile.provider_id,
-    models: profile.models, filter: profile.filter,
-    timeout: profile.timeout || 15, retries: profile.retries || 2, workers: profile.workers || 8,
-    repeat: 1, capabilities: false, fallback_models: knownWorking,
+    models: profile.models, filter: profile.filter, format: profile.format || 'auto', prefer_format: last.format,
+    timeout: profile.timeout || 15, retries: 1, workers: Math.min(+profile.workers || 8, 10),
+    repeat: 1, capabilities: false, fallback_models: knownWorking, prefer_models: knownWorking.slice(0, 3),
+    mode, max_tokens: 1,
   };
-  const result = { working: [], failed: [], errorMessage: null, config: null, keyStatus: null };
+  const result = { mode, listed: null, results: {}, errorMessage: null, keyStatus: null, format: null,
+                   formatNote: '', providerId: null, apiBase: null };
+  const live = liveChecks[profile.name] = { mode, done: 0, total: 0, counts: { working: 0, broken: 0, limited: 0, unverified: 0 } };
   try {
     const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Console': '1' }, body: JSON.stringify(payload) });
     const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
@@ -2888,22 +3369,51 @@ async function runProfileCheck(profile) {
       const lines = buffer.split('\n'); buffer = lines.pop();
       for (const line of lines) {
         if (!line.trim()) continue;
-        const evt = JSON.parse(line);
-        if (evt.type === 'model_result') {
-          if (evt.data.status === 'WORKING') result.working.push({ model: evt.data.model, time: evt.data.response_time_avg });
-          else result.failed.push(evt.data.model);
+        const evt = JSON.parse(line), d = evt.data;
+        if (evt.type === 'detected') { result.format = d.format; result.formatNote = d.note || ''; live.format = d.format; }
+        else if (evt.type === 'models_found') { result.listed = d.models; live.total = mode === 'deep' ? d.count : Math.min(3, d.count); }
+        else if (evt.type === 'model_result') {
+          const v = verdictOf(d);
+          result.results[d.model] = { state: v === 'key' ? 'broken' : v, status: d.status, time: d.response_time_avg ?? null,
+            error: d.error || '', code: d.code, gen: d.genuine || null, at: Date.now() };
+          live.done++; if (live.counts[v] != null) live.counts[v]++;
+          renderArchiveSoon();
         } else if (evt.type === 'summary') {
-          result.config = evt.data.config;
-          result.keyStatus = evt.data.key_status;
-          // A rejected key doesn't raise an "error" event, only a summary.
-          if (evt.data.key_status === 'INVALID') result.errorMessage = evt.data.key_message;
+          result.keyStatus = d.key_status; result.format = d.format || result.format;
+          result.providerId = d.provider_id; result.apiBase = d.base_url;
+          if (d.key_status !== 'VALID') result.errorMessage = d.key_message;
+        } else if (evt.type === 'error') {
+          result.errorMessage = d.message; result.keyStatus = d.key_status || 'UNCONFIRMED';
+          if (d.format) result.format = d.format;
         }
-        else if (evt.type === 'error') result.errorMessage = evt.data.message;
       }
     }
-  } catch (e) { result.errorMessage = e.message; }
+  } catch (e) { result.errorMessage = e.message; result.keyStatus = result.keyStatus || 'UNCONFIRMED'; }
+  delete liveChecks[profile.name];
   return result;
 }
+
+// Same shape as build_opencode_config() on the server, so a quick check (which keeps the models
+// verified by an earlier deep check) can still offer a config with all of them.
+function buildOpencodeConfig(providerId, baseUrl, names, fmt) {
+  const anthropic = fmt === 'anthropic';
+  const models = {}; names.forEach(m => { models[m] = { name: m }; });
+  return { $schema: 'https://opencode.ai/config.json',
+    provider: { [providerId]: { npm: anthropic ? '@ai-sdk/anthropic' : '@ai-sdk/openai-compatible',
+      name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
+      options: { baseURL: anthropic ? baseUrl.replace(/\/v1$/i, '') + '/v1' : baseUrl }, models } },
+    model: names.length ? `${providerId}/${names[0]}` : '' };
+}
+// Per-model map of a saved check; checks saved before this version only listed working models.
+function modelMap(lc) {
+  if (!lc) return {};
+  if (lc.models) return lc.models;
+  const map = {};
+  (lc.working || []).map(normalizeWorkingEntry).forEach(w => { map[w.model] = { state: 'working', time: w.time }; });
+  (lc.failed || []).forEach(m => { if (typeof m === 'string') map[m] = { state: 'broken' }; });
+  return map;
+}
+const AVAILABLE = ['working', 'listed', 'limited', 'unverified'];
 
 function markChecking(name, val) {
   const profiles = getProfiles();
@@ -2911,66 +3421,90 @@ function markChecking(name, val) {
   if (p) { p.checking = val; setProfiles(profiles); }
 }
 
-async function checkProfile(name) {
+async function checkProfile(name, mode = 'quick') {
   const profile = getProfiles().find(p => p.name === name);
   if (!profile) return;
-  const result = await runProfileCheck(profile);
-  result.working.sort((a, b) => (a.time ?? Infinity) - (b.time ?? Infinity));
+  const result = await runProfileCheck(profile, mode);
 
   const fresh = getProfiles();
   const target = fresh.find(p => p.name === name);
   if (!target) return;
 
   // Must be read BEFORE lastCheck is overwritten below.
-  const hadBefore = !!(target.lastCheck && target.lastCheck.working);
-  const previousWorking = ((target.lastCheck && target.lastCheck.working) || []).map(normalizeWorkingEntry).map(w => w.model);
-  const currentWorkingNames = result.working.map(w => w.model);
-  const added = currentWorkingNames.filter(m => !previousWorking.includes(m));
-  const removed = previousWorking.filter(m => !currentWorkingNames.includes(m));
+  const prev = target.lastCheck || null;
+  const prevMap = modelMap(prev);
+  const hadBefore = !!(prev && prev.models);
+  let models;
+  if (!result.listed) {
+    // Nothing listed (fast fail, dead host...): keep the last known per-model results on the card.
+    models = { ...prevMap };
+    Object.assign(models, result.results);
+  } else {
+    models = {};
+    for (const m of result.listed) {
+      models[m] = result.results[m] || (mode === 'quick' && prevMap[m] && prevMap[m].state !== 'listed'
+        ? { ...prevMap[m], cached: true } : { state: 'listed' });
+    }
+    Object.assign(models, result.results);
+  }
+  const keyValid = result.keyStatus === 'VALID';
+  const working = Object.entries(models).filter(([, v]) => v.state === 'working')
+    .map(([model, v]) => ({ model, time: v.time ?? null, gen: v.gen || null }))
+    .sort((a, b) => (a.time ?? Infinity) - (b.time ?? Infinity));
+  const avail = (map) => Object.keys(map).filter(m => AVAILABLE.includes(map[m].state));
+  const before = avail(prevMap), now = keyValid ? avail(models) : before;
+  const added = now.filter(m => !before.includes(m));
+  const removed = before.filter(m => !now.includes(m));
+  const providerId = result.providerId || target.provider_id || 'provider';
+  const apiBase = result.apiBase || target.base_url;
 
   target.checking = false;
   target.lastCheck = {
-    timestamp: Date.now(), working: result.working, failed: result.failed,
-    config: result.config, keyValid: !result.errorMessage, errorMessage: result.errorMessage,
+    timestamp: Date.now(), mode, models, working,
+    failed: Object.keys(models).filter(m => models[m].state === 'broken'),
+    config: working.length ? buildOpencodeConfig(providerId, apiBase, working.map(w => w.model), result.format) : null,
+    keyValid, keyStatus: result.keyStatus, errorMessage: result.errorMessage,
+    format: result.format || (prev && prev.format) || null, formatNote: result.formatNote,
     added, removed, hadPrevious: hadBefore,
   };
   setProfiles(fresh);
 
   // ---- LIVE NOTIFICATION on change ----
   if (hadBefore) {
-    if (!result.errorMessage && removed.length)
+    if (keyValid && removed.length)
       toast(T('notify.model_stopped', { name }), 'bad', T('notify.stopped_list', { list: removed.join(', ') }));
-    if (!result.errorMessage && added.length)
+    if (keyValid && added.length)
       toast(T('notify.new_model', { name }), 'ok', T('notify.added_list', { list: added.join(', ') }));
-    if (result.errorMessage)
-      toast(T('notify.key_down', { name }), 'bad', result.errorMessage);
-    if (!result.errorMessage && !added.length && !removed.length && result.working.length)
+    if (!keyValid)
+      toast(T('notify.key_down', { name }), 'bad', result.errorMessage || T('ks.' + (result.keyStatus || 'UNCONFIRMED')));
+    if (keyValid && !added.length && !removed.length && working.length)
       toast(T('notify.all_good', { name }), 'ok');
-  } else if (result.working.length) {
-    toast(T('notify.working', { name, n: result.working.length }), 'ok');
+  } else if (working.length) {
+    toast(T('notify.working', { name, n: working.length }), 'ok');
   }
   updateKeyStats();
 }
 
-async function checkProfileNow(name) {
+async function checkProfileNow(name, mode = 'quick') {
+  if (liveChecks[name]) { toast(T('monitor.busy'), 'warn'); return; }
   markChecking(name, true); renderArchive();
-  await checkProfile(name); renderArchive();
+  await checkProfile(name, mode); renderArchive();
 }
 async function checkAllProfiles() {
   if (monitorBusy) { toast(T('monitor.busy'), 'warn'); return; }
-  const names = getProfiles().map(p => p.name);
+  const names = getProfiles().map(p => p.name).filter(n => !liveChecks[n]);
   if (names.length === 0) { toast(T('monitor.nothing'), 'warn'); return; }
   monitorBusy = true;
   const btn = document.getElementById('checkAllBtn');
   if (btn) btn.disabled = true;
   try {
     names.forEach(n => markChecking(n, true)); renderArchive();
-    // Check keys two at a time: faster than one by one, gentle on the providers.
+    // Quick checks, three keys at a time: each one is a list call plus a single 1-token request.
     const queue = [...names];
     const worker = async () => {
-      while (queue.length) { const name = queue.shift(); await checkProfile(name); renderArchive(); }
+      while (queue.length) { const name = queue.shift(); await checkProfile(name, 'quick'); renderArchive(); }
     };
-    await Promise.all([worker(), worker()]);
+    await Promise.all([worker(), worker(), worker()]);
     toast(T('monitor.checked', { n: names.length }), 'info');
   } finally {
     monitorBusy = false;
@@ -3214,6 +3748,28 @@ function modelCell(model, rank) {
   return `<div class="model-cell"><span class="rank">${rank}</span><span>${escapeHtml(model)}</span>` +
          `<button class="mini-copy" title="${escapeHtml(T('row.copy_model'))}" onclick="copyRaw('${esc(model)}', this)">📋</button></div>`;
 }
+// "Is it the model it claims to be?" — consistency checks on the reply, never a proof.
+function genuineBadge(g, short) {
+  if (!g || !g.badge) return '';
+  const icon = { verified: '✓', suspicious: '⚠', unknown: '?' }[g.badge] || '?';
+  const label = T('gen.badge.' + g.badge);
+  const tip = [label, ...(g.reasons || []), T('gen.disclaimer')].join('\n');
+  return `<span class="gen ${escapeHtml(g.badge)}" title="${escapeHtml(tip)}">${icon}${short ? '' : ' ' + escapeHtml(label)}</span>`;
+}
+const ST_LABEL = () => ({
+  KEY_INVALID: T('st.KEY_INVALID'), MODEL_UNAVAILABLE: T('st.MODEL_UNAVAILABLE'),
+  LIMITED: T('st.LIMITED'), UNAVAILABLE: T('st.UNAVAILABLE'), NO_CREDIT: T('st.NO_CREDIT'),
+  DENIED: T('st.DENIED'), NO_ENDPOINT: T('st.NO_ENDPOINT'), SKIPPED: T('st.SKIPPED'),
+  INCOMPATIBLE: T('st.INCOMPATIBLE'), INVALID_RESPONSE: T('st.INVALID_RESPONSE'), FAILED: T('st.FAILED')
+});
+// Older servers send no verdict: derive it from the status the same way detect/VERDICT does.
+function verdictOf(r) {
+  if (r.verdict) return r.verdict;
+  if (r.status === 'WORKING') return 'working';
+  if (r.status === 'KEY_INVALID') return 'key';
+  if (r.status === 'LIMITED') return 'limited';
+  return ['UNAVAILABLE', 'NO_CREDIT', 'SKIPPED'].includes(r.status) ? 'unverified' : 'broken';
+}
 function updateRow(result) {
   const id = rowId(result.model);
   let tr = document.getElementById(id);
@@ -3221,24 +3777,22 @@ function updateRow(result) {
   const isOk = result.status === 'WORKING';
   if (isOk) { maxTime = Math.max(maxTime, result.response_time_avg); lastResults.working.push(result); }
   else lastResults.failed.push(result);
-  const labels = {
-    KEY_INVALID: T('st.KEY_INVALID'), MODEL_UNAVAILABLE: T('st.MODEL_UNAVAILABLE'),
-    LIMITED: T('st.LIMITED'), UNAVAILABLE: T('st.UNAVAILABLE'),
-    INCOMPATIBLE: T('st.INCOMPATIBLE'), INVALID_RESPONSE: T('st.INVALID_RESPONSE'), FAILED: T('st.FAILED')
-  };
-  const transient = ['LIMITED', 'UNAVAILABLE', 'INCOMPATIBLE'].includes(result.status);
-  const statusLabel = isOk ? T('st.WORKING') : (labels[result.status] || T('st.FAILED'));
-  tr.dataset.state = isOk ? 'ok' : 'bad';
+  const verdict = verdictOf(result);
+  const transient = verdict === 'limited' || verdict === 'unverified';
+  const statusLabel = isOk ? T('st.WORKING') : (ST_LABEL()[result.status] || T('st.FAILED'));
+  tr.dataset.state = isOk ? 'ok' : (transient ? 'warn' : 'bad');
   tr.classList.remove('flash'); void tr.offsetWidth; tr.classList.add('flash');
   const extra = [];
   if (isOk && result.runs > 1) extra.push(`min ${result.response_time_min}s · max ${result.response_time_max}s`);
   if (isOk && result.ttft != null) extra.push(T('row.first_token', { t: result.ttft }));
+  if (isOk && result.genuine && result.genuine.served && result.genuine.served !== result.model) extra.push(T('row.served', { model: result.genuine.served }));
+  const listedNote = verdict === 'broken' ? `<small>${T('verdict.broken')}</small>` : (transient ? `<small>${T('verdict.' + verdict)}</small>` : '');
   tr.innerHTML = `
     <td>${modelCell(result.model, '')}</td>
-    <td><span class="pill ${isOk ? 'ok' : (transient ? 'pending' : 'bad')}">${statusLabel}</span></td>
+    <td><span class="pill ${isOk ? 'ok' : (transient ? 'warn' : 'bad')}">${statusLabel}</span>${isOk ? genuineBadge(result.genuine) : ''}</td>
     <td>${isOk
         ? `<div class="bar-cell"><span>${result.response_time_avg}s</span><div class="bar-track"><div class="bar-fill" data-time="${result.response_time_avg}"></div></div></div>${extra.length ? `<span class="sub-metric">${escapeHtml(extra.join(' · '))}</span>` : ''}`
-        : `<div class="result-diagnosis"><strong>${escapeHtml(result.error || statusLabel)}</strong><small>HTTP ${escapeHtml(result.code || 0)}</small>${result.technical_error ? `<span title="${escapeHtml(result.technical_error)}">${T('row.tech_details')}</span>` : ''}</div>`}</td>
+        : `<div class="result-diagnosis"><strong>${escapeHtml(result.error || statusLabel)}</strong>${listedNote}<small>HTTP ${escapeHtml(result.code || 0)}</small>${result.technical_error ? `<span title="${escapeHtml(result.technical_error)}">${T('row.tech_details')}</span>` : ''}</div>`}</td>
     <td>${isOk && result.tokens_per_sec ? result.tokens_per_sec : `<span title="${isOk ? escapeHtml(T('row.enable_caps')) : ''}">—</span>`}</td>
     <td>${isOk ? capBadges(result.capabilities) : '—'}</td>`;
   refreshBars();
@@ -3255,12 +3809,13 @@ function refreshBars() {
 function updateLiveCounts() {
   const ok = lastResults.working.length, bad = lastResults.failed.length;
   const total = document.querySelectorAll('#tbody tr[data-state]').length;
+  document.getElementById('fcWarn').textContent = document.querySelectorAll('#tbody tr[data-state="warn"]').length;
   document.getElementById('statWorking').textContent = ok;
   document.getElementById('statFailed').textContent = bad;
   document.getElementById('statTotal').textContent = total;
   document.getElementById('fcAll').textContent = total;
   document.getElementById('fcOk').textContent = ok;
-  document.getElementById('fcBad').textContent = bad;
+  document.getElementById('fcBad').textContent = document.querySelectorAll('#tbody tr[data-state="bad"]').length;
 }
 function setResultFilter(f) {
   resultFilter = f;
@@ -3329,7 +3884,8 @@ function showBanner(data) {
   document.getElementById('bannerBig').textContent = `${data.working}/${data.total}`;
   document.getElementById('bannerTitle').textContent = data.working
     ? T('banner.n_working', { working: data.working, total: data.total }) : T('banner.none');
-  const parts = [data.key_message];
+  const parts = [data.format_name ? T('banner.type', { type: data.format_name }) : '', data.key_message].filter(Boolean);
+  if (data.format_note) parts.push(data.format_note);
   if (fastest) parts.push(T('banner.fastest', { model: fastest.model, t: fastest.response_time_avg }));
   parts.push(T('banner.duration', { t: data.total_time_seconds }));
   document.getElementById('bannerSub').textContent = parts.join(' · ');
@@ -3341,6 +3897,7 @@ async function runTest() {
     toast(T('run.fill_toast'), 'warn');
     return;
   }
+  if (!testerKeyRef && takeNormalizedUrl('base_url') === null) return;
   currentRun = new AbortController();
   setRunButton(true);
   document.getElementById('dlReport').disabled = true;
@@ -3357,6 +3914,7 @@ async function runTest() {
     base_url: document.getElementById('base_url').value,
     api_key: testerKeyRef ? '' : document.getElementById('api_key').value,
     key_ref: testerKeyRef || undefined,
+    format: document.getElementById('api_format').value,
     provider_id: document.getElementById('provider_id').value,
     models: document.getElementById('models').value,
     filter: document.getElementById('filter').value,
@@ -3399,7 +3957,10 @@ async function runTest() {
 
 function handleEvent(evt) {
   if (evt.type === 'status') setStatus(evt.data.message, false, true);
-  else if (evt.type === 'error') setStatus(evt.data.message, true);
+  else if (evt.type === 'error') {
+    setStatus(evt.data.key_status ? `${T('ks.' + evt.data.key_status)} — ${evt.data.message}` : evt.data.message, true);
+  }
+  else if (evt.type === 'detected') setStatus(T('run.detected', { type: evt.data.name, url: evt.data.base_url }) + (evt.data.why ? ' · ' + evt.data.why : ''), false, true);
   else if (evt.type === 'models_found') {
     setStatus(T('run.testing_n', { n: evt.data.count }), false, true);
     evt.data.models.forEach(addRow);
@@ -3643,6 +4204,7 @@ function fmtSecs(s) { return s >= 60 ? `${Math.round(s / 60)} ${T('unit.min')}` 
 
 function resetProviderForm() {
   ['prov_id', 'prov_name', 'prov_base', 'prov_models'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('prov_base_preview').hidden = true;
   document.getElementById('prov_format').value = 'openai';
   document.getElementById('provFormTitle').textContent = T('prov.new');
   document.getElementById('provFormCancel').style.display = 'none';
@@ -3654,11 +4216,13 @@ function editProvider(id) {
   document.getElementById('prov_base').value = p.base_url;
   document.getElementById('prov_format').value = p.format;
   document.getElementById('prov_models').value = (p.manual_models || []).join(', ');
+  updateUrlPreview('prov_base');
   document.getElementById('provFormTitle').textContent = T('common.edit_title', { name: p.name });
   document.getElementById('provFormCancel').style.display = '';
   document.getElementById('prov_name').focus();
 }
 async function saveProviderForm() {
+  if (takeNormalizedUrl('prov_base') === null) return;
   const body = {
     id: document.getElementById('prov_id').value || undefined,
     name: document.getElementById('prov_name').value.trim(),
@@ -3775,6 +4339,7 @@ function openKeyInTester(pid, kid) {
   input.type = 'text'; input.readOnly = true; input.classList.add('from-provider');
   input.value = `🔒 ${k.masked} (${p.name})`;
   document.getElementById('provider_id').value = p.name;
+  document.getElementById('api_format').value = FMT_LABEL[p.format] ? p.format : 'auto';
   document.getElementById('savedProfiles').value = '';
   showTab('test');
   setStatus(T('tester.from_provider'));
@@ -4245,6 +4810,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Typing a key by hand (or pasting/clearing) stops using a stored provider key.
   document.getElementById('api_key').addEventListener('focus', clearTesterKeyRef);
   document.getElementById('base_url').addEventListener('input', clearTesterKeyRef);
+  document.getElementById('base_url').addEventListener('input', () => updateUrlPreview('base_url'));
+  document.getElementById('api_key').addEventListener('input', () => updateUrlPreview('base_url'));
+  document.getElementById('prov_base').addEventListener('input', () => updateUrlPreview('prov_base'));
+  document.getElementById('prov_format').addEventListener('change', () => updateUrlPreview('prov_base'));
   setInterval(() => { if (monitorNextRunAt) updateNextRunLabel(); }, 1000);
   const toTop = document.getElementById('toTop');
   window.addEventListener('scroll', () => toTop.classList.toggle('show', window.scrollY > 500), { passive: true });
@@ -4615,8 +5184,15 @@ def ui_store_apply(name, ops):
 
 
 # The gateway reuses the tester's own request/probe functions.
-TESTER = {"fetch_models_list": fetch_models_list, "test_model": test_model,
+TESTER = {"fetch_models_list": fetch_models_list, "test_model": test_model, "quick_key_check": quick_key_check,
           "make_request": make_request, "extract_models_from_response": extract_models_from_response}
+
+
+def same_base(a, b):
+    try:
+        return detect.normalize_base_url(a) == detect.normalize_base_url(b)
+    except ValueError:
+        return a.rstrip("/") == b.rstrip("/")
 
 
 def import_profiles(profiles):
@@ -4624,11 +5200,17 @@ def import_profiles(profiles):
     imported = 0
     st = gateway.store()
     for prof in profiles:
-        base = (prof.get("base_url") or "").strip().rstrip("/")
         key = (prof.get("api_key") or "").strip()
+        try:
+            base = detect.normalize_base_url(prof.get("base_url"))
+        except ValueError:
+            continue
         if not base or not key:
             continue
-        existing = next((p for p in st.providers() if p["base_url"].rstrip("/") == base), None)
+        # The type the last check detected, else the one picked in the form, else a guess from URL/key.
+        fmt = ((prof.get("lastCheck") or {}).get("format") or prof.get("format") or "")
+        fmt = fmt if fmt in FMT_NAME else (detect.format_hint(base, key)[0] or "openai")
+        existing = next((p for p in st.providers() if same_base(p["base_url"], base)), None)
         if existing:
             pid = existing["id"]
         else:
@@ -4636,7 +5218,7 @@ def import_profiles(profiles):
             candidate, n = name, 2
             while any(p["name"].lower() == candidate.lower() for p in st.providers()):
                 candidate, n = f"{name}-{n}", n + 1
-            pid = gateway.save_provider({"name": candidate, "base_url": base, "format": "openai",
+            pid = gateway.save_provider({"name": candidate, "base_url": base, "format": fmt,
                                          "manual_models": prof.get("models") or ""})
         imported += gateway.add_keys(pid, key, prof.get("name", ""))["added"]
     return imported

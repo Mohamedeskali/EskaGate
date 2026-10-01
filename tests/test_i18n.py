@@ -25,10 +25,25 @@ def load_all():
     return {lang: json.loads((ROOT / "i18n" / f"{lang}.json").read_text(encoding="utf-8")) for lang in i18n.LANGS}
 
 
+CODE_FILES = ("api_web_dashboard_v2.py", "gateway.py", "agents.py", "alerts.py", "phone.py", "i18n.py", "detect.py")
+
+
+def mentioned_keys(known):
+    """Keys built at run time also count as used: a quoted key ('keys.deep_progress' in a ternary)
+    or a prefix joined with a value (T('ks.' + status), i18n.t("srv.key." + status))."""
+    found = set()
+    for name in CODE_FILES:
+        src = (ROOT / name).read_text(encoding="utf-8")
+        found |= set(re.findall(r"""["']([a-z_]+\.[\w.]+)["']""", src)) & known
+        for prefix in re.findall(r"""\b(?:T|i18n\.t)\(["']([\w.]+\.)["'] \+""", src):
+            found |= {k for k in known if k.startswith(prefix)}
+    return found
+
+
 def used_keys():
     """Every key the code asks for: page ({{t:..}}, {{h:..}}, T('..')), Python (i18n.t("..")), shell (t key)."""
     keys = set()
-    for name in ("api_web_dashboard_v2.py", "gateway.py", "agents.py", "alerts.py", "phone.py", "i18n.py"):
+    for name in CODE_FILES:
         src = (ROOT / name).read_text(encoding="utf-8")
         keys |= set(re.findall(r"\{\{[th]:(\w+\.[\w.]+)\}\}", src))
         keys |= set(re.findall(r"\bT\('(\w+\.[\w.]+)'", src))
@@ -41,7 +56,7 @@ def used_keys():
     for name in ("eskali_api_launcher.sh", "install_eskali_api.sh"):
         src = (ROOT / name).read_text(encoding="utf-8")
         keys |= set(re.findall(r"\bt ((?:launcher|install)\.\w+)", src))
-    return keys
+    return {k for k in keys if not k.endswith(".")}   # a prefix like T('ks.' + status): see mentioned_keys()
 
 
 class TranslationFiles(unittest.TestCase):
@@ -69,7 +84,8 @@ class TranslationFiles(unittest.TestCase):
         self.assertFalse(missing, f"keys used in code but missing from the translation files: {missing}")
 
     def test_no_unused_keys(self):
-        unused = sorted(k for k in set(load_all()["ar"]) - used_keys() if not k.startswith("lang."))
+        known = set(load_all()["ar"])
+        unused = sorted(k for k in known - used_keys() - mentioned_keys(known) if not k.startswith("lang."))
         self.assertFalse(unused, f"keys in the translation files that no code uses: {unused}")
 
     def test_shell_keys_readable_without_python(self):

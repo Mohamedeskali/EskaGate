@@ -24,6 +24,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import detect
 import i18n
 
 # ---------------------------------------------------------------------------
@@ -1201,8 +1202,8 @@ def _proxy(handler, body, client_fmt, model, stream, start, log, incoming):
 def save_provider(data):
     st = store()
     name = (data.get("name") or "").strip()
-    base_url = (data.get("base_url") or "").strip().rstrip("/")
-    if not name or not base_url.lower().startswith(("http://", "https://")):
+    base_url = detect.normalize_base_url(data.get("base_url"))   # ValueError with a clear message
+    if not name or not base_url:
         raise ValueError(i18n.t("err.provider_required"))
     if "/" in name:
         raise ValueError(i18n.t("err.provider_slash"))
@@ -1299,48 +1300,21 @@ def resolve_key_ref(ref):
     return (p["base_url"], k["key"]) if k else (None, None)
 
 
+# Tester key status -> gateway key status (and so its cooldown).
+_KIND = {"VALID": "ok", "INVALID": "invalid", "WRONG_ENDPOINT": "invalid", "NO_CREDIT": "no_credit",
+         "LIMITED": "limited", "DOWN": "error", "UNCONFIRMED": "error"}
+
+
 def _test_one_key(p, k, tester):
-    """Reuses the dashboard's own tester functions (fetch_models_list / test_model)."""
-    fmt = p.get("format", "openai")
-    timeout = 20
-    if fmt == "openai":
-        headers = {"Content-Type": "application/json", "Accept": "application/json",
-                   "Authorization": f"Bearer {k['key']}", "User-Agent": "API-Test-Console/1.1"}
-        models, err = tester["fetch_models_list"](p["base_url"], headers, timeout, 0)
-        test_models = list(p.get("manual_models") or []) + [m for m in models if m not in (p.get("manual_models") or [])]
-        if not test_models:
-            kind, _ = classify(0, {"error": {"message": err or ""}})
-            return {"status": kind if kind in COOLDOWN else "error", "models": [],
-                    "error": err or i18n.t("err.no_model_list")}
-        base = p["base_url"].rstrip("/")
-        r = tester["test_model"](test_models[0], base + "/chat/completions" if not base.endswith("/chat/completions")
-                                 else base, headers, timeout, 0, "ping", 1, False)
-        if r["status"] == "WORKING":
-            return {"status": "ok", "models": models, "error": "", "tested_model": test_models[0],
-                    "time": r["response_time_avg"]}
-        kind = {"KEY_INVALID": "invalid", "LIMITED": "limited"}.get(r["status"], "error")
-        if r["status"] == "MODEL_UNAVAILABLE" and models:
-            kind = "ok"                            # key is accepted; that one model just isn't served
-        return {"status": kind, "models": models, "error": r.get("error", "") if kind != "ok" else "",
-                "tested_model": test_models[0]}
-    # Anthropic-format provider: list models + one tiny message.
-    headers = upstream_headers(p, k["key"])
-    base = p["base_url"].rstrip("/")
-    models_url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
-    status, res = tester["make_request"](models_url, headers, None, timeout)
-    models = tester["extract_models_from_response"](res) if status == 200 else []
-    test_models = list(p.get("manual_models") or []) + models
-    if not test_models:
-        kind = "invalid" if status in (401, 403) else "error"
-        return {"status": kind, "models": [], "error": short_error(res) or i18n.t("err.no_model_list")}
-    status, res = tester["make_request"](upstream_url(p, "anthropic"), headers,
-                                         {"model": test_models[0], "max_tokens": 8,
-                                          "messages": [{"role": "user", "content": "ping"}]}, timeout)
-    if status == 200:
-        return {"status": "ok", "models": models, "error": "", "tested_model": test_models[0]}
-    kind, _ = classify(status, res)
-    kind = kind if kind in COOLDOWN else "error"
-    return {"status": kind, "models": models, "error": short_error(res), "tested_model": test_models[0]}
+    """The tester's quick check: model list in the provider's format, then one real 1-token call on a
+    cheap model. A list alone never marks a key "ok"; a wrong format (Anthropic key on an OpenAI-style
+    provider, or the reverse) comes back as its own message."""
+    manual = list(p.get("manual_models") or [])
+    r = tester["quick_key_check"](p["base_url"], k["key"], p.get("format", "openai"), manual)
+    models = r["models"]
+    kind = _KIND.get(r["key_status"], "error")
+    return {"status": kind, "models": models, "error": "" if kind == "ok" else (r["message"] or ""),
+            "tested_model": r["tested_model"], "time": r["time"]}
 
 
 def test_provider_keys(pid, tester):
