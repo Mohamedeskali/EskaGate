@@ -16,6 +16,8 @@ The user writes in Moroccan Darija or Arabic. Reply in the language they use. Th
 | `gateway.py` | Gateway: provider/key store, `dispatch()` with failover and cooldowns, request/response/stream translation, logs. |
 | `i18n.py`, `i18n/` | Translations: `ar.json`, `en.json`, `fr.json` (flat, same keys, `{name}` placeholders), `t()` helper, saved language, and a CLI (`python3 i18n.py <key> [name=value] [lang=xx]`) used by the shell scripts. |
 | `tests/test_i18n.py` | `python3 -m unittest discover tests`: same keys in all files, same placeholders, every used key exists, no unused keys, each language renders with the right `dir`, no Arabic left in the en/fr page, `node --check` on the scripts. |
+| `detect.py` | Key/endpoint detection, no network except `host_problem()`: `normalize_base_url()` (mirrored in the page's JS between `/*norm-start*/` and `/*norm-end*/`, kept equal by a test), `format_hint()`, `key_problem()` (placeholder / malformed / wrong-provider keys; skipped for local hosts, which take any key), `host_problem()` (DNS + TCP, skipped behind a proxy), `headers()`, `cheap_order()`, `same_model()`, `genuine()`. |
+| `tests/test_detect.py` | A fake provider (`Fake` handler: `/openai`, `/anthropic`, `/fakeclaude`, `/nocredit`, `/html`, `/down`) driven through `run_pipeline()` and the gateway key test, plus the Python/JS URL normalizer parity check. |
 | `agents.py` | Agent config switching (enable/disable with backup and restore), custom agents, per-agent model filter, icons. |
 | `alerts.py` | Telegram alerts. Sets `gateway.ON_EVENT` (gateway never imports it); events `key_failed`, `provider_down`, `key_ok`, `quota_low`, `request` (start/end, for the idle check), `request_logged` (from `add_log`, for the daily summary counters). Dedup per (provider or `agent:<name>`, cause) for `DEDUP` = 300 s. Threads: sender (logs every alert to the history), ticker every 10 s (`check_idle`, `check_summary`, stats save), command poller (`getUpdates` long polling; `handle_command` for /status, /switch; only the saved chat). While the poller runs, "🔎 جيبو" (`tg.find`) uses the chat it saw, since Telegram allows one update reader. `ESKAGATE_TELEGRAM_API` overrides the API base for tests. |
 | `phone.py` | Phone access: a second `ThreadingHTTPServer` on the private LAN IP (same port, `server.lan = True`), started/stopped from the page. Token in memory, rotated on stop; off after every restart. |
@@ -62,6 +64,20 @@ Tabs save profiles/formats as per-entry ops (`POST /api/store/<name>` with `{ops
 - Gateway endpoints on the same port: `POST /v1/chat/completions` (OpenAI), `POST /v1/messages` (+ `/count_tokens`, Anthropic), `GET /v1/models`. OpenAI clients use `http://127.0.0.1:8000/v1`; Anthropic clients use the bare root.
 - **After editing any `.py` file, restart the server** (`./eskali_api_launcher.sh stop && ./eskali_api_launcher.sh start`) and tell the user to press F5. The running process does not reload code, and a missed restart has already caused a "my change doesn't show" report. A restart briefly interrupts agents that are using the gateway.
 
+## Key and model detection (`run_pipeline()` + `detect.py`)
+
+`POST /api/run` params beyond the old ones: `format` (`auto`|`openai`|`anthropic`), `prefer_format` (last detected), `mode` (`quick`|`deep`, default deep), `max_tokens` (cards send 1), `prefer_models`.
+
+1. No-request checks: URL normalized (event `status` `srv.url_normalized`), `key_problem()`, `host_problem()`. Fast fails emit `error` with `key_status`.
+2. `discover()`: model list in the likely style (chosen > last detected > URL/key hint), then the other style on 400/401/403/404/405. Explicit type that only works in the other style → `WRONG_ENDPOINT`. An `sk-ant-` key where nothing answered Anthropic-style → `WRONG_ENDPOINT`. Anthropic lists via `x-api-key` + `anthropic-version` on `<root>/v1/models?limit=1000` (paged). Event `detected` {format, base_url, note}.
+3. Probe: up to 3 cheapest chat models (`cheap_order`), one real call each, until one works or the key itself fails (`KEY_INVALID`/`NO_CREDIT` → the rest are `SKIPPED`). A model list alone never makes a key `VALID`.
+4. Deep mode only: every other model in parallel (`workers`, cards cap at 10), early stop after 3 key-level refusals.
+5. `summary`: `key_status` ∈ VALID / INVALID / NO_CREDIT / LIMITED / DOWN / WRONG_ENDPOINT / UNCONFIRMED (`key_verdict()`), `format`, `counts`.
+
+Each `model_result` has `status` (adds `NO_CREDIT`, `DENIED` (403), `NO_ENDPOINT` (non-JSON 404/405), `SKIPPED`) and `verdict` (`VERDICT`): working / broken ("listed but not working") / limited (429, retried once with Retry-After capped at 8 s) / unverified / key. Working results carry `genuine` {badge: verified|suspicious|unknown, reasons, served}: model name match (dates, `-latest`, provider prefixes and `:free` ignored), and for Claude names on Anthropic format also `msg_` id, `stop_reason`, `usage`, `request-id: req_…` / `anthropic-*` headers (missing headers = unknown on a third-party host, suspicious on anthropic.com). Never shown as certain.
+
+Key cards (`checkProfile(name, mode)`): 🔄 / "check all" / monitor = quick, 🔬 = deep. `lastCheck.models` = {model: {state: working|broken|limited|unverified|listed, time, gen, error, cached}}; a quick check keeps earlier deep results for models still listed. `lastCheck.working`/`failed`/`config` stay for the copy menus; old saved checks are read through `modelMap()`. Progress streams into the card (`liveChecks`, `renderArchiveSoon()`). The gateway's "test keys" runs the same quick check (`quick_key_check()` via `TESTER`), and `save_provider()` / `import_profiles()` normalize URLs (import also takes the detected format).
+
 ## Agents (`agents.py`)
 
 Built-in agents live in `BUILTIN` (the order is the display order): Claude Code, opencode, pi, Hermes. **Config formats were checked against the installed tools, not guessed**; keep it that way.
@@ -79,6 +95,7 @@ Enable/Disable contract: Enable backs up the config first. Disable restores the 
 ## Translations
 
 - `INDEX_HTML` holds keys, not text: `{{t:key}}` (HTML-escaped), `{{h:key}}` (trusted HTML from the file), `{{i18n:lang|dir|json}}`. `render_index(lang)` fills them per request from the saved language (cached per process, so edits to `i18n/*.json` also need a restart).
+- Keys built at run time (`T('ks.' + status)`, `i18n.t("srv.key." + status)`) count as used through their prefix, and quoted full keys count too (`mentioned_keys()` in `tests/test_i18n.py`). A new Python file that calls `i18n.t()` goes into `CODE_FILES` there.
 - JS uses `T('key', {name: value})` (not `t`, which is a common local variable there). `T()` does not escape: escape user data before it goes into HTML, and wrap `T()` in `escapeHtml()` inside attributes. `LANG` and `RTL` are globals.
 - Python uses `i18n.t("key", name=...)` (server messages, `gateway.py`/`agents.py`/`phone.py` errors shown in the page). `key` and `lang` are positional-only, so they also work as placeholders (`{key}` is common in alerts). Messages sent to agents through `/v1/*` stay English.
 - Telegram (`alerts.py`): alerts, the daily summary, bot replies (`bot.*`) and settings errors use `i18n.t()` with the saved UI language, read when each message is built, so they follow a language switch at once. Keys `alert.*`, `tg.*`, `bot.*`, `quota.*`. `handle_command` maps `gateway.switch_active_key()` errors by comparing with `i18n.t("err.unknown_provider")` / `i18n.t("err.no_other_key")`. Quota bucket names come from `gateway.quota_label()`. The phone 401/403 page (`_deny`) uses the saved language and direction.
@@ -124,6 +141,8 @@ Done this session, all verified and live on port 8000:
 - Key title links to its source site.
 
 2026-09-28, branch `feature/i18n-ar-en-fr`: the UI, server messages, launcher and installer are translated (ar/en/fr) with a language switcher and RTL/LTR layout; see **Translations**.
+
+2026-10-01, branch `claude/jolly-gates-utvrpl`: stronger key/model detection (see **Key and model detection**), smart URL field with preview, API type select in the tester, "unverified" filter in the results table.
 
 ## Pending / open items
 

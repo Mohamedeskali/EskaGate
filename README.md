@@ -3,7 +3,9 @@
 A local web app for testing API keys and running a local AI gateway. It uses only the Python 3 standard library, so there is nothing to install beyond Python.
 
 - **Test keys:** finds a key's models (`/models`, `/v1/models`), sends a short test prompt to each one and shows the results live. If a provider hides its model list, type the model names in the manual models field.
-- **Monitor saved keys:** re-checks them on a timer and flags added or removed models.
+- **Real key and model checks:** detects the API type (Anthropic or OpenAI-compatible) from the URL, the key and the endpoint's answers, and uses the right headers and paths for each. Placeholder keys, dead hosts, web pages and wrong endpoint types fail fast, before any paid request. A key counts as working only after a real 1-token request succeeds. 🔄 is a quick check (model list + one request on a cheap model); 🔬 Deep check sends one 1-token request per model in parallel and labels each one: working, listed but not working, or rate limited (unverified). Each working model also gets a Verified / Suspicious / Unknown badge from consistency checks on the reply (model name, and for Claude the message shape and Anthropic headers). These checks are a hint, not a proof.
+- **Smart URL field:** `api.example.com/v1/v1/` becomes `https://api.example.com/v1` (scheme added, pasted endpoint paths and slashes removed, `localhost:port` stays `http`). The corrected URL is shown under the field before you save.
+- **Monitor saved keys:** re-checks them on a timer (quick check) and flags added or removed models.
 - **Local AI gateway:** one local key (`sk-local-...`) in front of many real provider keys, with failover and OpenAI ↔ Anthropic translation.
   - OpenAI clients: `http://127.0.0.1:8000/v1`
   - Anthropic clients: `http://127.0.0.1:8000`
