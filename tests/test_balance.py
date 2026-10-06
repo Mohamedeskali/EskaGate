@@ -150,6 +150,24 @@ class Balance(unittest.TestCase):
         self.assertEqual(dict(events)["balance"]["remaining"], 6.2)
         self.assertLess(kinds.index("balance"), kinds.index("error"))      # sent before the run ends
 
+    def test_page_open_refresh_fills_saved_and_gateway_keys(self):
+        old_store, old_read = gateway.STORE, app.ui_store_read
+        gateway.STORE = None
+        app.ui_store_read = lambda name: [{"name": "relay", "base_url": f"{self.base}/newapi/v1", "api_key": KEY},
+                                          {"name": "web", "base_url": f"{self.base}/html/v1", "api_key": "sk-x-1"}]
+        try:
+            pid = gateway.save_provider({"name": "gw", "base_url": f"{self.base}/unlim/v1", "format": "openai"})
+            gateway.add_keys(pid, KEY.replace("Balance", "Unlimit0"))
+            r = app.refresh_balances(force=True)
+            self.assertEqual(r["profiles"]["relay"]["remaining"], 6.2)
+            self.assertFalse(r["profiles"]["web"]["ok"])
+            self.assertFalse(r["providers"][0]["keys"][0]["balance"]["ok"])     # wrong key for /unlim: not available
+            SEEN.clear()
+            app.refresh_balances()                                               # fresh enough: no new calls
+            self.assertEqual(SEEN, [])
+        finally:
+            gateway.STORE, app.ui_store_read = old_store, old_read
+
 
 class Alerts(unittest.TestCase):
     def setUp(self):

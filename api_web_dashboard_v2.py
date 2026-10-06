@@ -723,6 +723,7 @@ def run_pipeline(params, emit):
         t.join(timeout + 5)
         if bal.get("result"):
             b = bal["result"]
+            balance.remember(api_key, b)
             emit("balance", b)
             gateway._emit("balance", key_id=balance.key_id(api_key), key=gateway.mask_key(api_key),
                           label=params.get("label") or urlparse(base_url).netloc, balance=b)
@@ -3080,6 +3081,19 @@ function balText(b, wrap = x => x) {
   if (b.unlimited) return T('bal.unlimited') + (b.used != null ? ' · ' + T('bal.used', { amount: m(b.used) }) : '');
   return b.total ? T('bal.left_of', { left: m(b.remaining), total: m(b.total) }) : T('bal.left', { left: m(b.remaining) });
 }
+// Balances fetched on page open (/api/balance), by saved key name; the newest of these and the last check wins.
+let liveBalances = {};
+async function refreshBalances(force = false, cached = false) {
+  let r;
+  try { r = await api('/api/balance', { force, cached }); } catch (e) { return; }
+  liveBalances = r.profiles || {};
+  if (gwState) { gwState.providers = r.providers; renderProviders(); }
+  renderArchive();
+}
+function cardBalance(p) {
+  const a = liveBalances[p.name], b = p.lastCheck && p.lastCheck.balance;
+  return !a ? b : !b ? a : (a.at >= b.at ? a : b);
+}
 function balanceHtml(b) {
   if (!b) return '';
   if (!b.ok) return `<div class="bal na" title="${escapeHtml(T('bal.na_title'))}">💰 ${T('bal.na')}</div>`;
@@ -3276,7 +3290,7 @@ function renderArchive() {
           ${statusBadge(p)}
         </div>
         <div class="kcard-body">
-          ${balanceHtml(p.lastCheck && p.lastCheck.balance)}
+          ${balanceHtml(cardBalance(p))}
           <div class="kv-row"><span class="k">URL</span>
             <span class="v" dir="ltr" title="${esc(p.base_url || '')}">${p.base_url ? escapeHtml(p.base_url) : '—'}</span>
             <button class="mini-copy" title="${escapeHtml(T('keys.copy_url'))}" ${p.base_url ? '' : 'disabled'} onclick="copyRaw('${esc(p.base_url)}', this)">📋</button></div>
@@ -4882,6 +4896,7 @@ function onTabShown(name) {
 document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(); applyToastUI(); initNav(); syncLangUI(); syncPhone();
   await initServerStore();
+  refreshBalances(false, true).then(() => refreshBalances());   // last known at once, then fresh ones
   refreshProfileSelect();
   updateKeyStats();
   initMonitorUI();
@@ -5112,6 +5127,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/providers/test":
             results = gateway.test_provider_keys(p.get("id"), TESTER)
             return {**self._state(), "results": results}
+        elif path == "/api/balance":
+            return refresh_balances(bool(p.get("force")), bool(p.get("cached")))
         elif path == "/api/providers/import":
             return {**self._state(), "imported": import_profiles(p.get("profiles") or [])}
         elif path == "/api/gateway/regenerate":
@@ -5274,8 +5291,37 @@ TESTER = {"fetch_models_list": fetch_models_list, "test_model": test_model, "qui
 
 def profile_balances():
     """Balances last reported for the saved keys ("مفاتيحي"), for Telegram /status and the daily summary."""
-    return [(balance.key_id(p.get("api_key")), p.get("name") or "?", (p.get("lastCheck") or {}).get("balance"))
+    return [(balance.key_id(p.get("api_key")), p.get("name") or "?",
+             balance.newest(balance.cached(p["api_key"]), (p.get("lastCheck") or {}).get("balance")))
             for p in ui_store_read("profiles") if isinstance(p, dict) and p.get("api_key")]
+
+
+def refresh_balances(force=False, cached=False):
+    """Balances of every saved key and gateway key (read-only calls, at most every 10 min unless forced),
+    so the page shows them on open without running a test. `cached` answers at once from balances.json."""
+    def norm(u):
+        try:
+            return detect.normalize_base_url(u or "")
+        except ValueError:
+            return ""
+    profiles = [p for p in ui_store_read("profiles") if isinstance(p, dict) and p.get("api_key")]
+    st = gateway.store()
+    gw = [(p, k) for p in st.providers() for k in p.get("keys", [])]
+    items = [(norm(p.get("base_url")), p["api_key"]) for p in profiles] + [(p["base_url"], k["key"]) for p, k in gw]
+    found, fetched = balance.refresh(items, float("inf") if cached else 0 if force else 600)
+    with st.lock:
+        for p, k in gw:
+            b = found.get(balance.key_id(k["key"]))
+            if b and b is not k.get("balance"):
+                k["balance"] = b
+        st.save()
+    labels = {balance.key_id(p["api_key"]): (p["api_key"], p.get("name") or "?") for p in profiles}
+    labels.update({balance.key_id(k["key"]): (k["key"], f"{p['name']} · {gateway.mask_key(k['key'])}") for p, k in gw})
+    for kid in fetched:
+        key, label = labels[kid]
+        gateway._emit("balance", key_id=kid, key=gateway.mask_key(key), label=label, balance=found[kid])
+    return {"profiles": {p["name"]: found.get(balance.key_id(p["api_key"])) for p in profiles if p.get("name")},
+            "providers": st.public_view()}
 
 
 def same_base(a, b):

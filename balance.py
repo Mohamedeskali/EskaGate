@@ -11,10 +11,15 @@ Result: {"at", "ok": True, "remaining", "total" (or None), "currency", "unlimite
 import datetime
 import hashlib
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+import detect
+import gateway
 
 UNLIMITED = 1e8          # One API / New API report "unlimited" keys as hard_limit_usd 100000000
 CURRENCY_SIGN = {"USD": "$", "CNY": "¥", "EUR": "€"}
@@ -164,6 +169,15 @@ def new_api(base, api_key, timeout):
     return None
 
 
+def _reachable(base_url, timeout):
+    """DNS + TCP within a hard deadline: a dead host must not hold the page for its DNS timeouts."""
+    res = []
+    t = threading.Thread(target=lambda: res.append(detect.host_problem(base_url, min(timeout, 5))), daemon=True)
+    t.start()
+    t.join(min(timeout, 6))
+    return res == [None]
+
+
 def fetch(base_url, api_key, timeout=10):
     """Balance of one key, or {"ok": False} when the provider doesn't report it."""
     out = None
@@ -171,7 +185,7 @@ def fetch(base_url, api_key, timeout=10):
         u = urllib.parse.urlsplit(base_url)
         host = (u.hostname or "").lower()
         root = f"{u.scheme}://{u.netloc}"
-        if host in NO_BALANCE or not api_key:
+        if host in NO_BALANCE or not api_key or not _reachable(base_url, timeout):
             out = None
         elif host.endswith("openrouter.ai"):
             out = openrouter(root, api_key, timeout)
@@ -192,3 +206,49 @@ def low(b, minimum):
     """True when the reported balance is under `minimum` (in the key's own currency)."""
     return bool(b and b.get("ok") and not b.get("unlimited") and b.get("remaining") is not None
                 and b["remaining"] < minimum)
+
+
+# ---------------------------------------------------------------------------
+# Last known balance per key (balances.json, keyed by key_id), so the page shows it on open
+# ---------------------------------------------------------------------------
+_lock = threading.Lock()
+_cache = None
+
+
+def _load():
+    global _cache
+    if _cache is None:
+        try:
+            _cache = json.loads((gateway.DATA_DIR / "balances.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _cache = {}
+    return _cache
+
+
+def cached(api_key):
+    with _lock:
+        return _load().get(key_id(api_key))
+
+
+def remember(api_key, b):
+    with _lock:
+        _load()[key_id(api_key)] = b
+        gateway.write_private(gateway.DATA_DIR / "balances.json", json.dumps(_cache, ensure_ascii=False))
+
+
+def newest(*items):
+    return max((b for b in items if b), key=lambda b: b.get("at", 0), default=None)
+
+
+def refresh(items, max_age=600):
+    """Fetch the balance of every (base_url, api_key) not checked in the last max_age seconds.
+    max_age=inf only reads what is known. Returns {key_id: balance} and the set of key_ids fetched now."""
+    todo, now = {}, time.time()
+    for base, k in items:
+        old = cached(k)
+        if k and base and max_age != float("inf") and (not old or now - old.get("at", 0) >= max_age):
+            todo.setdefault(key_id(k), (base, k))
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for (base, k), b in zip(todo.values(), ex.map(lambda x: fetch(*x), todo.values())):
+            remember(k, b)
+    return {key_id(k): cached(k) for _, k in items if k}, set(todo)
