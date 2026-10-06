@@ -137,7 +137,7 @@ class Store:
                         "last_checked": k.get("last_checked"), "last_used": k.get("last_used"),
                         "cooldown_left": int(k["cooldown_until"] - now) if cooling else 0,
                         "active": k["id"] == p.get("active_key_id"),
-                        "quota": k.get("quota"),
+                        "quota": k.get("quota"), "balance": k.get("balance"),
                     })
                 out.append({
                     "id": p["id"], "name": p["name"], "base_url": p["base_url"],
@@ -1310,11 +1310,12 @@ def _test_one_key(p, k, tester):
     cheap model. A list alone never marks a key "ok"; a wrong format (Anthropic key on an OpenAI-style
     provider, or the reverse) comes back as its own message."""
     manual = list(p.get("manual_models") or [])
-    r = tester["quick_key_check"](p["base_url"], k["key"], p.get("format", "openai"), manual)
+    r = tester["quick_key_check"](p["base_url"], k["key"], p.get("format", "openai"), manual,
+                                  label=f"{p['name']} · {mask_key(k['key'])}")
     models = r["models"]
     kind = _KIND.get(r["key_status"], "error")
     return {"status": kind, "models": models, "error": "" if kind == "ok" else (r["message"] or ""),
-            "tested_model": r["tested_model"], "time": r["time"]}
+            "tested_model": r["tested_model"], "time": r["time"], "balance": r.get("balance")}
 
 
 def test_provider_keys(pid, tester):
@@ -1332,6 +1333,8 @@ def test_provider_keys(pid, tester):
         for k, r in zip(keys, results):
             k["status"], k["last_error"], k["last_checked"] = r["status"], r.get("error", ""), time.time()
             k["cooldown_until"] = 0 if r["status"] == "ok" else time.time() + COOLDOWN.get(r["status"], 20)
+            if r.get("balance"):
+                k["balance"] = r["balance"]
             for m in r.get("models", []):
                 if m not in found:
                     found.append(m)

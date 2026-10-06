@@ -624,5 +624,19 @@
  "group.broken": "Listés, ne fonctionnent pas ({n})",
  "group.limited": "Limités / non vérifiés ({n})",
  "group.listed": "Listés, pas encore vérifiés ({n})",
- "srv.other_key_anthropic_url": "Mauvais type d'endpoint : cela ressemble à une clé {name}, mais cette URL est un endpoint de type Anthropic."
+ "srv.other_key_anthropic_url": "Mauvais type d'endpoint : cela ressemble à une clé {name}, mais cette URL est un endpoint de type Anthropic.",
+ "bal.na": "Solde : non disponible",
+ "bal.na_title": "Le fournisseur ne donne pas le solde de cette clé (ou n'a pas répondu). L'app ne devine jamais.",
+ "bal.unlimited": "∞ clé illimitée",
+ "bal.used": "{amount} utilisés",
+ "bal.left_of": "{left} restants sur {total}",
+ "bal.left": "{left} restants",
+ "bal.title": "Solde tel que le fournisseur le donne pour cette clé (une lecture qui ne consomme rien)",
+ "tg.balance_label": "💰 M'alerter quand le solde d'une clé passe sous",
+ "tg.balance_title": "Dans la devise du fournisseur ($ ou ¥). Une fois par jour et par clé.",
+ "tg.err_balance": "Le seuil de solde doit être un nombre.",
+ "alert.balance_low": "💰 EskaGate · {name}\nLa clé {key} est presque à sec : {left} (sous {min}).\nUne fois par jour et par clé.",
+ "alert.summary_balances": "💰 EskaGate · Soldes",
+ "bot.balances": "💰 Soldes :",
+ "ah.type.balance_low": "Solde bas"
 }

@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 
+import balance
 import gateway
 import i18n
 
@@ -34,6 +35,7 @@ DEDUP = 300
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 CHAT_RE = re.compile(r"^(-?\d{3,}|@[A-Za-z0-9_]{5,})$")
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+PROFILE_BALANCES = lambda: []    # set by the server: [(key name, balance)] from the saved keys ("مفاتيحي")
 
 
 
@@ -63,14 +65,23 @@ def load():
         data = {}
     return {"bot_token": data.get("bot_token", ""), "chat_id": str(data.get("chat_id", "")),
             "enabled": bool(data.get("enabled", True)), "idle_minutes": int(data.get("idle_minutes", 10)),
-            "summary": bool(data.get("summary", True)), "summary_time": data.get("summary_time") or "09:00"}
+            "summary": bool(data.get("summary", True)), "summary_time": data.get("summary_time") or "09:00",
+            "balance_min": _min(data.get("balance_min", 1))}
+
+
+def _min(v):
+    try:
+        return max(0.0, min(float(v), 1e6))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def public():
     c = load()
     return {"configured": bool(c["bot_token"] and c["chat_id"]), "enabled": c["enabled"],
             "bot_token": gateway.mask_key(c["bot_token"]), "chat_id": gateway.mask_key(c["chat_id"]),
-            "idle_minutes": c["idle_minutes"], "summary": c["summary"], "summary_time": c["summary_time"]}
+            "idle_minutes": c["idle_minutes"], "summary": c["summary"], "summary_time": c["summary_time"],
+            "balance_min": c["balance_min"]}
 
 
 def _ready(c=None):
@@ -99,6 +110,11 @@ def _merged(data):
             c["idle_minutes"] = max(0, min(int(data["idle_minutes"]), 1440))
         except (TypeError, ValueError):
             raise ValueError(i18n.t("tg.err_minutes"))
+    if data.get("balance_min") not in (None, ""):
+        try:
+            c["balance_min"] = max(0.0, min(float(data["balance_min"]), 1e6))
+        except (TypeError, ValueError):
+            raise ValueError(i18n.t("tg.err_balance"))
     if data.get("summary_time"):
         m = TIME_RE.match(str(data["summary_time"]).strip())
         if not m:
@@ -130,6 +146,7 @@ def _load_stats():
         _stats.setdefault("last_summary", "")
         _stats.setdefault("agents", {})
         _stats.setdefault("quota_warned", {})
+        _stats.setdefault("balance_warned", {})
         _stats["dirty"] = False
     return _stats
 
@@ -316,6 +333,21 @@ def _handle(kind, i):
                         remaining=i["remaining"], limit=i["limit"], pct=pct, reset=reset),
                  "quota_low", provider=i["provider"])
         _save_stats()
+    elif kind == "balance":
+        b, c = i["balance"], load()
+        if not balance.low(b, c["balance_min"]):
+            return
+        today = datetime.date.today().isoformat()
+        with _lock:
+            st = _load_stats()
+            if st["balance_warned"].get(i["key_id"]) == today or not _ready(c):
+                return
+            st["balance_warned"][i["key_id"]] = today
+            st["dirty"] = True
+        left = balance.text(b, i18n.t("bal.used"))
+        _enqueue(i18n.t("alert.balance_low", name=i["label"], key=i["key"], left=left,
+                        min=balance.money(c["balance_min"], b["currency"])), "balance_low", provider=i["label"])
+        _save_stats()
     elif kind == "request_logged":
         name = i.get("client") or "unknown"
         if name in ("curl", "unknown"):
@@ -391,8 +423,33 @@ def check_summary(now=None):
         _enqueue(i18n.t("alert.summary", name=name, start=start, requests=a["requests"],
                         tokens=_fmt_tokens(a["tokens"]), switches=a["switches"], errors=errors),
                  "summary", agent=name)
+    lines = balance_lines()
+    if lines:
+        _enqueue(i18n.t("alert.summary_balances") + "\n" + "\n".join(lines), "summary")
     _save_stats(force=True)
     return True
+
+
+def balance_lines():
+    """'• name: 12.40$ / 20.00$' for every key whose provider reported a balance (gateway keys and saved keys),
+    each key once."""
+    seen, out = set(), []
+    items = []
+    for p in gateway.store().providers():
+        for k in p.get("keys", []):
+            items.append((balance.key_id(k["key"]), f"{p['name']} · {gateway.mask_key(k['key'])}", k.get("balance")))
+    try:
+        items += list(PROFILE_BALANCES())
+    except Exception as e:
+        sys.stderr.write(f"[alerts] balances: {type(e).__name__}\n")
+    for kid, name, b in items:
+        txt = balance.text(b, i18n.t("bal.used"))
+        if not txt or kid in seen:
+            continue
+        seen.add(kid)
+        warn = " ⚠️" if balance.low(b, load()["balance_min"]) else ""
+        out.append(f"• {name}: {txt}{warn} ({time.strftime('%d/%m %H:%M', time.localtime(b['at']))})")
+    return out
 
 
 def _ticker():
@@ -416,7 +473,9 @@ def handle_command(text):
     arg = parts[1].strip() if len(parts) > 1 else ""
     if cmd == "/status":
         lines = gateway.provider_status_lines()
-        return "📋 EskaGate\n" + ("\n".join(lines) if lines else i18n.t("bot.no_providers"))
+        text = "📋 EskaGate\n" + ("\n".join(lines) if lines else i18n.t("bot.no_providers"))
+        bal = balance_lines()
+        return text + ("\n\n" + i18n.t("bot.balances") + "\n" + "\n".join(bal) if bal else "")
     if cmd == "/switch":
         if not arg:
             names = ", ".join(p["name"] for p in gateway.store().providers()) or "—"

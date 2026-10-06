@@ -43,6 +43,7 @@ import agents   # noqa: E402  (Claude Code / opencode / pi / Hermes config switc
 import alerts   # noqa: E402  (Telegram alerts from gateway events)
 import phone    # noqa: E402  (phone access over the home Wi-Fi, token-protected)
 import qr       # noqa: E402  (QR code for the phone link)
+import balance  # noqa: E402  (remaining balance, as the provider reports it for the key)
 from http.cookies import SimpleCookie  # noqa: E402
 
 
@@ -712,7 +713,22 @@ def run_pipeline(params, emit):
     fallback_models = [m for m in (params.get("fallback_models") or []) if isinstance(m, str) and m.strip()]
     prefer_models = [m for m in (params.get("prefer_models") or []) if isinstance(m, str) and m.strip()]
 
+    bal = {}
+
+    def send_balance():
+        """The key's balance (read-only call started next to the tests), once, before the end."""
+        t = bal.pop("thread", None)
+        if not t:
+            return
+        t.join(timeout + 5)
+        if bal.get("result"):
+            b = bal["result"]
+            emit("balance", b)
+            gateway._emit("balance", key_id=balance.key_id(api_key), key=gateway.mask_key(api_key),
+                          label=params.get("label") or urlparse(base_url).netloc, balance=b)
+
     def fail(key_status, message, fmt=None):
+        send_balance()
         emit("error", {"message": message, "key_status": key_status, "format": fmt})
 
     # ---- خطوة 0: فحوصات بلا طلب (مفتاح مزور/ناقص، host ميت) ----
@@ -723,6 +739,9 @@ def run_pipeline(params, emit):
     dead = detect.host_problem(base_url, timeout)
     if dead:
         return fail("DOWN", dead, fmt=hint)
+    bal["thread"] = threading.Thread(target=lambda: bal.update(result=balance.fetch(base_url, api_key, min(timeout, 15))),
+                                     daemon=True)
+    bal["thread"].start()
 
     # ---- خطوة 1: نوع الـ API + جلب الموديلات ----
     models_list = list(dict.fromkeys(m.strip() for m in manual_models.split(",") if m.strip()))
@@ -757,10 +776,12 @@ def run_pipeline(params, emit):
             models_list = [m for m in models_list if pattern.search(m)]
             emit("status", {"message": i18n.t("srv.filter_matched", filter=filter_regex, n=len(models_list), before=before)})
         except re.error as e:
+            send_balance()
             emit("error", {"message": i18n.t("srv.bad_regex", error=e)})
             return
 
     if not models_list:
+        send_balance()
         emit("error", {"message": i18n.t("srv.no_models")})
         return
 
@@ -842,6 +863,7 @@ def run_pipeline(params, emit):
 
     config_data = build_opencode_config(provider_id, api_base, working_sorted, fmt) if working_sorted else None
 
+    send_balance()
     emit("summary", {
         "base_url": api_base, "provider_id": provider_id,
         "total_time_seconds": total_time, "mode": mode,
@@ -855,15 +877,18 @@ def run_pipeline(params, emit):
     emit("done", {})
 
 
-def quick_key_check(base_url, api_key, fmt, prefer_models=(), timeout=20):
+def quick_key_check(base_url, api_key, fmt, prefer_models=(), timeout=20, label=""):
     """Gateway "test keys": the same pipeline in quick mode (list + one real 1-token call), collected."""
-    out = {"key_status": "UNCONFIRMED", "message": "", "models": [], "tested_model": None, "time": None}
+    out = {"key_status": "UNCONFIRMED", "message": "", "models": [], "tested_model": None, "time": None,
+           "balance": None}
 
     def emit(kind, data):
         if kind == "error":
             out.update(key_status=data.get("key_status") or "UNCONFIRMED", message=data["message"])
         elif kind == "models_found":
             out["models"] = data["models"]
+        elif kind == "balance":
+            out["balance"] = data
         elif kind == "model_result":
             out["tested_model"] = data["model"]
             out["time"] = data.get("response_time_avg")
@@ -876,7 +901,7 @@ def quick_key_check(base_url, api_key, fmt, prefer_models=(), timeout=20):
             elif not out["message"]:
                 out["message"] = data["key_message"]
     run_pipeline({"base_url": base_url, "api_key": api_key, "format": fmt, "mode": "quick", "max_tokens": 1,
-                  "timeout": timeout, "retries": 1, "prefer_models": list(prefer_models)}, emit)
+                  "timeout": timeout, "retries": 1, "prefer_models": list(prefer_models), "label": label}, emit)
     return out
 
 
@@ -1852,6 +1877,16 @@ INDEX_HTML = r"""
   .fmt-chip.anthropic { color: var(--accent-2); border-color: var(--accent-2); }
   .fmt-chip.openai { color: var(--accent); border-color: var(--accent); }
   .kc-note { font-size: 11.5px; color: var(--warn); margin-top: 6px; overflow-wrap: anywhere; }
+  .bal { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; font-size:12px; color:var(--muted); }
+  .bal b { font-family:var(--font-mono); font-weight:600; color:var(--text); }
+  .bal.low, .bal.low b { color:var(--warn); }
+  .bal.na { color:var(--faint); }
+  .bal .bal-bar { flex:0 0 70px; height:5px; border-radius:3px; background:var(--border); overflow:hidden; }
+  .bal .bal-bar i { display:block; height:100%; background:var(--ok); }
+  .bal.low .bal-bar i { background:var(--warn); }
+  .bal .q-at { color:var(--faint); font-size:11px; }
+  .kcard-body > .bal { margin: 2px 0 8px; }
+  .key-row .bal { grid-column: 2 / -1; font-size:11px; margin-top:-4px; }
   .kc-progress { margin: 2px 0 8px; font-size: 11.5px; color: var(--muted); }
   .kc-progress .track { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; margin-top: 4px; }
   .kc-progress .fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .3s ease; }
@@ -1990,7 +2025,7 @@ INDEX_HTML = r"""
   .ah-src { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .ah-msg { color:var(--muted); overflow-wrap:anywhere; }
   .ah-more { padding:8px 16px; color:var(--faint); font-size:12px; }
-  @media (max-width: 700px) { .key-row .acts { grid-column: 3; grid-row: 1; } .key-row .quota { grid-column: 2 / 4; margin-top: 0; } }
+  @media (max-width: 700px) { .key-row .acts { grid-column: 3; grid-row: 1; } .key-row .quota, .key-row .bal { grid-column: 2 / 4; margin-top: 0; } }
   @media (max-width: 700px) { .ah-row { grid-template-columns: auto minmax(0, 1fr); } .ah-row .ah-msg { grid-column: 1 / -1; } }
   /* ---------- PHONE LAYOUT (≤520px): compact header, nothing wider than the screen ---------- */
   .key-grid > *, .agent-grid > * { min-width: 0; }
@@ -2519,6 +2554,8 @@ INDEX_HTML = r"""
           <button class="ghost" title="{{t:tg.find_title}}" onclick="findTelegramChat()">{{t:tg.find}}</button></div></div>
       <div class="field"><label>{{t:tg.idle_label}}</label>
         <input id="tgIdle" type="number" min="0" max="1440" dir="ltr" placeholder="10"></div>
+      <div class="field"><label>{{t:tg.balance_label}}</label>
+        <input id="tgBalanceMin" type="number" min="0" step="0.5" dir="ltr" placeholder="1" title="{{t:tg.balance_title}}"></div>
       <div class="setting-row tg-sub">
         <div>
           <div class="s-label">{{t:tg.summary}}</div>
@@ -2573,6 +2610,7 @@ const MONITOR_KEY = 'api_test_console_monitor';
 const PREFS_KEY = 'api_test_console_prefs';   // theme + toasts (new, additive)
 
 let lastConfig = null;
+let lastBalance = null;   // balance event of the current test
 let lastResults = { working: [], failed: [] };
 let maxTime = 1;
 let monitorTimerId = null;
@@ -3027,6 +3065,29 @@ function maskKey(key) {
   if (key.length <= 8) return '•'.repeat(key.length);
   return key.slice(0,4) + '•'.repeat(Math.max(4, key.length - 8)) + key.slice(-4);
 }
+// Remaining balance, only as the provider reported it for the key (never guessed). Absent = not checked yet.
+const CURRENCY_SIGN = { USD: '$', CNY: '¥', EUR: '€' };
+function fmtMoney(v, cur) {
+  const n = Math.abs(v) < 1e6 ? v.toFixed(2) : (v / 1e6).toFixed(1) + 'M', sign = CURRENCY_SIGN[cur];
+  return sign ? n + sign : `${n} ${cur}`;
+}
+function balLow(b) { return !!(b && b.ok && !b.unlimited && b.remaining != null && (b.remaining < 1 || (b.total && b.remaining < b.total * 0.1))); }
+// `wrap` marks up each amount (bold, LTR) for the cards; plain text for the test banner.
+function balText(b, wrap = x => x) {
+  if (!b) return '';
+  if (!b.ok) return T('bal.na');
+  const m = v => wrap(fmtMoney(v, b.currency));
+  if (b.unlimited) return T('bal.unlimited') + (b.used != null ? ' · ' + T('bal.used', { amount: m(b.used) }) : '');
+  return b.total ? T('bal.left_of', { left: m(b.remaining), total: m(b.total) }) : T('bal.left', { left: m(b.remaining) });
+}
+function balanceHtml(b) {
+  if (!b) return '';
+  if (!b.ok) return `<div class="bal na" title="${escapeHtml(T('bal.na_title'))}">💰 ${T('bal.na')}</div>`;
+  const low = balLow(b);
+  const bar = b.total && !b.unlimited
+    ? `<span class="bal-bar"><i style="width:${Math.max(0, Math.min(100, b.remaining / b.total * 100)).toFixed(0)}%"></i></span>` : '';
+  return `<div class="bal${low ? ' low' : ''}" title="${escapeHtml(T('bal.title'))}">💰 <span>${balText(b, x => `<bdi dir="ltr"><b>${escapeHtml(x)}</b></bdi>`)}</span>${low ? ' ⚠️' : ''}${bar}<span class="q-at">${timeAgo(b.at * 1000)}</span></div>`;
+}
 function timeAgo(ts) {
   if (!ts) return T('time.never');
   const diff = Math.round((Date.now() - ts) / 1000);
@@ -3215,6 +3276,7 @@ function renderArchive() {
           ${statusBadge(p)}
         </div>
         <div class="kcard-body">
+          ${balanceHtml(p.lastCheck && p.lastCheck.balance)}
           <div class="kv-row"><span class="k">URL</span>
             <span class="v" dir="ltr" title="${esc(p.base_url || '')}">${p.base_url ? escapeHtml(p.base_url) : '—'}</span>
             <button class="mini-copy" title="${escapeHtml(T('keys.copy_url'))}" ${p.base_url ? '' : 'disabled'} onclick="copyRaw('${esc(p.base_url)}', this)">📋</button></div>
@@ -3370,10 +3432,10 @@ async function runProfileCheck(profile, mode) {
     models: profile.models, filter: profile.filter, format: profile.format || 'auto', prefer_format: last.format,
     timeout: profile.timeout || 15, retries: 1, workers: Math.min(+profile.workers || 8, 10),
     repeat: 1, capabilities: false, fallback_models: knownWorking, prefer_models: knownWorking.slice(0, 3),
-    mode, max_tokens: 1,
+    mode, max_tokens: 1, label: profile.name,
   };
   const result = { mode, listed: null, results: {}, errorMessage: null, keyStatus: null, format: null,
-                   formatNote: '', providerId: null, apiBase: null };
+                   formatNote: '', providerId: null, apiBase: null, balance: null };
   const live = liveChecks[profile.name] = { mode, done: 0, total: 0, counts: { working: 0, broken: 0, limited: 0, unverified: 0 } };
   try {
     const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Console': '1' }, body: JSON.stringify(payload) });
@@ -3386,6 +3448,7 @@ async function runProfileCheck(profile, mode) {
         if (!line.trim()) continue;
         const evt = JSON.parse(line), d = evt.data;
         if (evt.type === 'detected') { result.format = d.format; result.formatNote = d.note || ''; live.format = d.format; }
+        else if (evt.type === 'balance') { result.balance = d; }
         else if (evt.type === 'models_found') { result.listed = d.models; live.total = mode === 'deep' ? d.count : Math.min(3, d.count); }
         else if (evt.type === 'model_result') {
           const v = verdictOf(d);
@@ -3481,6 +3544,7 @@ async function checkProfile(name, mode = 'quick') {
     keyValid, keyStatus: result.keyStatus, errorMessage: result.errorMessage,
     format: result.format || (prev && prev.format) || null, formatNote: result.formatNote,
     added, removed, hadPrevious: hadBefore,
+    balance: result.balance || (prev && prev.balance) || null,
   };
   setProfiles(fresh);
 
@@ -3902,6 +3966,7 @@ function showBanner(data) {
   const parts = [data.format_name ? T('banner.type', { type: data.format_name }) : '', data.key_message].filter(Boolean);
   if (data.format_note) parts.push(data.format_note);
   if (fastest) parts.push(T('banner.fastest', { model: fastest.model, t: fastest.response_time_avg }));
+  if (lastBalance) parts.push('💰 ' + balText(lastBalance));
   parts.push(T('banner.duration', { t: data.total_time_seconds }));
   document.getElementById('bannerSub').textContent = parts.join(' · ');
   banner.classList.add('show');
@@ -3918,7 +3983,7 @@ async function runTest() {
   document.getElementById('dlReport').disabled = true;
   document.getElementById('resultBanner').classList.remove('show');
   document.getElementById('tbody').innerHTML = '';
-  lastResults = { working: [], failed: [] }; maxTime = 0.001; lastConfig = null;
+  lastResults = { working: [], failed: [] }; maxTime = 0.001; lastConfig = null; lastBalance = null;
   refreshCopyDD();
   updateLiveCounts();
   document.getElementById('statTime').textContent = '…';
@@ -3976,6 +4041,7 @@ function handleEvent(evt) {
     setStatus(evt.data.key_status ? `${T('ks.' + evt.data.key_status)} — ${evt.data.message}` : evt.data.message, true);
   }
   else if (evt.type === 'detected') setStatus(T('run.detected', { type: evt.data.name, url: evt.data.base_url }) + (evt.data.why ? ' · ' + evt.data.why : ''), false, true);
+  else if (evt.type === 'balance') lastBalance = evt.data;
   else if (evt.type === 'models_found') {
     setStatus(T('run.testing_n', { n: evt.data.count }), false, true);
     evt.data.models.forEach(addRow);
@@ -4075,6 +4141,7 @@ function renderTelegram() {
   document.getElementById('tgTokenSaved').innerHTML = t.bot_token ? T('tg.saved_value', { value: `<bdi dir="ltr">${escapeHtml(t.bot_token)}</bdi>` }) : '';
   document.getElementById('tgChatSaved').innerHTML = t.chat_id ? T('tg.saved_value', { value: `<bdi dir="ltr">${escapeHtml(t.chat_id)}</bdi>` }) : '';
   document.getElementById('tgIdle').value = t.idle_minutes ?? 10;
+  document.getElementById('tgBalanceMin').value = t.balance_min ?? 1;
   document.getElementById('tgSummaryToggle').classList.toggle('on', !!t.summary);
   document.getElementById('tgSummaryTime').value = t.summary_time || '09:00';
 }
@@ -4085,6 +4152,7 @@ function toggleSummary() {
 function tgForm() {
   return { bot_token: document.getElementById('tgToken').value.trim(), chat_id: document.getElementById('tgChat').value.trim(),
     idle_minutes: Number(document.getElementById('tgIdle').value || 0),
+    balance_min: document.getElementById('tgBalanceMin').value,
     summary_time: document.getElementById('tgSummaryTime').value || '09:00' };
 }
 async function saveTelegram(extra) {
@@ -4178,6 +4246,7 @@ function renderProviders() {
           <button class="ghost" title="${escapeHtml(T('prov.delete_key'))}" onclick="deleteProviderKey('${esc(p.id)}', '${esc(k.id)}')">🗑</button>
         </span>
         ${quotaHtml(k.quota)}
+        ${balanceHtml(k.balance)}
       </div>`;
     }).join('') || `<div class="empty-state" style="padding:14px;">${T('prov.no_keys')}</div>`;
     const models = p.models.length
@@ -4418,7 +4487,7 @@ async function loadLogs() {
 }
 /* ---- alert history (every Telegram alert sent, from alert-history.jsonl) ---- */
 const AH_TYPES = { no_credit: T('ah.type.no_credit'), invalid: T('ah.type.invalid'), limited: T('ah.type.limited'), error: T('ah.type.error'),
-  provider_down: T('ah.type.provider_down'), recovered: T('ah.type.recovered'), quota_low: T('ah.type.quota_low'), idle: T('ah.type.idle'),
+  provider_down: T('ah.type.provider_down'), recovered: T('ah.type.recovered'), quota_low: T('ah.type.quota_low'), balance_low: T('ah.type.balance_low'), idle: T('ah.type.idle'),
   active: T('ah.type.active'), summary: T('ah.type.summary') };
 let ahEntries = [];
 async function loadAlertHistory() {
@@ -5203,6 +5272,12 @@ TESTER = {"fetch_models_list": fetch_models_list, "test_model": test_model, "qui
           "make_request": make_request, "extract_models_from_response": extract_models_from_response}
 
 
+def profile_balances():
+    """Balances last reported for the saved keys ("مفاتيحي"), for Telegram /status and the daily summary."""
+    return [(balance.key_id(p.get("api_key")), p.get("name") or "?", (p.get("lastCheck") or {}).get("balance"))
+            for p in ui_store_read("profiles") if isinstance(p, dict) and p.get("api_key")]
+
+
 def same_base(a, b):
     try:
         return detect.normalize_base_url(a) == detect.normalize_base_url(b)
@@ -5254,6 +5329,7 @@ def main():
         pass
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    alerts.PROFILE_BALANCES = profile_balances
     alerts.start()
     url = f"http://{args.host}:{args.port}"
     print(i18n.t("cli.running", url=url))

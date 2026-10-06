@@ -624,5 +624,19 @@
  "group.broken": "فاللائحة ولكن ما خدامينش ({n})",
  "group.limited": "محدودين / ما تأكدوش ({n})",
  "group.listed": "فاللائحة، باقي ما تفحصوش ({n})",
- "srv.other_key_anthropic_url": "نوع الـ endpoint غالط: هادا كيبان مفتاح ديال {name}، وهاد الرابط endpoint على طريقة Anthropic."
+ "srv.other_key_anthropic_url": "نوع الـ endpoint غالط: هادا كيبان مفتاح ديال {name}، وهاد الرابط endpoint على طريقة Anthropic.",
+ "bal.na": "الرصيد: ما مصرحش",
+ "bal.na_title": "المزود ما كيعطيش الرصيد ديال هاد المفتاح (ولا ما جاوبش). البرنامج ما كيخمنش.",
+ "bal.unlimited": "∞ مفتاح بلا حد",
+ "bal.used": "{amount} مستعمل",
+ "bal.left_of": "{left} باقي من {total}",
+ "bal.left": "{left} باقي",
+ "bal.title": "الرصيد كيما عطاه المزود للمفتاح (طلب قراية بلا ما يتصرف حتى شي رصيد)",
+ "tg.balance_label": "💰 نبهني ملي الرصيد ديال شي مفتاح ينزل تحت",
+ "tg.balance_title": "بنفس العملة ديال المزود ($ ولا ¥). مرة فالنهار لكل مفتاح.",
+ "tg.err_balance": "الحد ديال الرصيد خاصو يكون رقم.",
+ "alert.balance_low": "💰 EskaGate · {name}\nالمفتاح {key} قرب يسالي الرصيد: {left} (تحت {min}).\nمرة فالنهار لكل مفتاح.",
+ "alert.summary_balances": "💰 EskaGate · الأرصدة",
+ "bot.balances": "💰 الأرصدة:",
+ "ah.type.balance_low": "رصيد قليل"
 }

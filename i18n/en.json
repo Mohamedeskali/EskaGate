@@ -624,5 +624,19 @@
  "group.broken": "Listed, not working ({n})",
  "group.limited": "Rate limited / unverified ({n})",
  "group.listed": "Listed, not checked yet ({n})",
- "srv.other_key_anthropic_url": "Wrong endpoint type: this looks like a {name} key, but this URL is an Anthropic-style endpoint."
+ "srv.other_key_anthropic_url": "Wrong endpoint type: this looks like a {name} key, but this URL is an Anthropic-style endpoint.",
+ "bal.na": "Balance: not available",
+ "bal.na_title": "The provider doesn't report this key's balance (or didn't answer). The app never guesses.",
+ "bal.unlimited": "∞ unlimited key",
+ "bal.used": "{amount} used",
+ "bal.left_of": "{left} left of {total}",
+ "bal.left": "{left} left",
+ "bal.title": "Balance as the provider reports it for this key (a read-only call that spends nothing)",
+ "tg.balance_label": "💰 Alert me when a key's balance drops under",
+ "tg.balance_title": "In the provider's own currency ($ or ¥). Once a day per key.",
+ "tg.err_balance": "The balance threshold must be a number.",
+ "alert.balance_low": "💰 EskaGate · {name}\nKey {key} is running low: {left} (under {min}).\nOnce a day per key.",
+ "alert.summary_balances": "💰 EskaGate · Balances",
+ "bot.balances": "💰 Balances:",
+ "ah.type.balance_low": "Low balance"
 }
