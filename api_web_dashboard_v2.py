@@ -1875,6 +1875,11 @@ INDEX_HTML = r"""
   .kcard-foot .icon-act { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface);
     color: var(--text); cursor: pointer; transition: var(--trans); font-size: 14px; }
   .kcard-foot .icon-act:hover { border-color: var(--accent); color: var(--accent); }
+  .kcard-foot .icon-act.star { filter: grayscale(1); opacity: .45; }
+  .kcard-foot .icon-act.star:hover { opacity: .8; }
+  .kcard-foot .icon-act.star.on { filter: none; opacity: 1; border-color: #e0a800; background: rgba(224, 168, 0, .12); }
+  .kcard.starred { border-color: rgba(224, 168, 0, .55); }
+  .kc-star { font-size: 13px; }
   .kcard-foot .icon-act.danger:hover { border-color: var(--bad); color: var(--bad); }
   .kcard-foot .copy-dd > button { padding: 8px 12px; font-size: 12px; }
   .kcard-foot .copy-dd .dd-menu { top: auto; bottom: calc(100% + 6px); }
@@ -2244,6 +2249,7 @@ INDEX_HTML = r"""
         <button class="chip" data-kf="warn" onclick="setKeyFilter('warn')">{{t:keys.f_warn}}<span class="n" id="kfWarn">0</span></button>
         <button class="chip" data-kf="bad" onclick="setKeyFilter('bad')">{{t:keys.f_bad}}<span class="n" id="kfBad">0</span></button>
         <button class="chip" data-kf="idle" onclick="setKeyFilter('idle')">{{t:keys.f_idle}}<span class="n" id="kfIdle">0</span></button>
+        <button class="chip" data-kf="star" onclick="setKeyFilter('star')">🌟 {{t:keys.f_star}}<span class="n" id="kfStar">0</span></button>
         <input class="search-input" id="keySearch" placeholder="{{t:keys.search_ph}}" oninput="renderArchive()">
       </div>
       <div class="toolbar-actions">
@@ -3164,11 +3170,11 @@ async function sendProfileToGateway(name) {
 function renderArchive() {
   const body = document.getElementById('archiveBody');
   const profiles = getProfiles();
-  const counts = { all: profiles.length, ok: 0, warn: 0, bad: 0, idle: 0 };
-  profiles.forEach(p => counts[profileState(p)]++);
+  const counts = { all: profiles.length, ok: 0, warn: 0, bad: 0, idle: 0, star: 0 };
+  profiles.forEach(p => { counts[profileState(p)]++; if (p.starred) counts.star++; });
   const setN = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
   setN('ksTotal', counts.all); setN('ksOk', counts.ok); setN('ksWarn', counts.warn); setN('ksBad', counts.bad);
-  setN('kfAll', counts.all); setN('kfOk', counts.ok); setN('kfWarn', counts.warn); setN('kfBad', counts.bad); setN('kfIdle', counts.idle);
+  setN('kfAll', counts.all); setN('kfOk', counts.ok); setN('kfWarn', counts.warn); setN('kfBad', counts.bad); setN('kfIdle', counts.idle); setN('kfStar', counts.star);
   updateKeyStats();
 
   if (profiles.length === 0) {
@@ -3180,7 +3186,7 @@ function renderArchive() {
   const formats = getFormats();
   const icons = { ok: '✅', warn: '⚠️', bad: '⛔', idle: '⏳' };
   const cards = profiles.map((p, i) => ({ p, i, st: profileState(p) }))
-    .filter(({ p, st }) => (keyFilter === 'all' || st === keyFilter)
+    .filter(({ p, st }) => (keyFilter === 'all' || st === keyFilter || (keyFilter === 'star' && p.starred))
       && (!q || (p.name || '').toLowerCase().includes(q) || (p.base_url || '').toLowerCase().includes(q) || (p.source || '').toLowerCase().includes(q)
         || ((p.lastCheck && p.lastCheck.working) || []).some(w => String(normalizeWorkingEntry(w).model).toLowerCase().includes(q))
         || Object.keys((p.lastCheck && p.lastCheck.models) || {}).some(m => m.toLowerCase().includes(q))))
@@ -3197,11 +3203,11 @@ function renderArchive() {
       const deepHint = p.lastCheck && p.lastCheck.keyValid && Object.values(p.lastCheck.models || {}).some(v => v.state === 'listed')
         ? `<div class="kc-note">${T('keys.deep_hint')}</div>` : '';
       return `
-      <div class="kcard ${st}">
+      <div class="kcard ${st}${p.starred ? ' starred' : ''}">
         <div class="kcard-head">
           <span class="kc-ic">${icons[st]}</span>
           <div class="kc-title">
-            <div class="kc-name">${sourceUrl(p.source)
+            <div class="kc-name">${p.starred ? `<span class="kc-star" title="${escapeHtml(T('keys.starred'))}">🌟</span> ` : ''}${sourceUrl(p.source)
               ? `<a class="kc-link" href="${escapeHtml(sourceUrl(p.source))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(T('keys.open_url', { url: sourceUrl(p.source) }))}">${escapeHtml(p.name)} <span class="ext">↗</span></a>`
               : `<span title="${escapeHtml(T('keys.link_hint'))}">${escapeHtml(p.name)}</span>`}</div>
             <div class="kc-sub">⏱ ${timeAgo(p.lastCheck && p.lastCheck.timestamp)} · ${T('keys.working_count', { n: workingCount })} · ${fmtChip(p.lastCheck)}</div>
@@ -3240,6 +3246,7 @@ function renderArchive() {
             </div>
           </div>
           <span class="spacer"></span>
+          <button class="icon-act star${p.starred ? ' on' : ''}" title="${escapeHtml(T(p.starred ? 'keys.unstar' : 'keys.star'))}" onclick="toggleStar('${esc(p.name)}')">🌟</button>
           <button class="icon-act" title="${escapeHtml(T('keys.open_tester'))}" onclick="loadFromArchive('${esc(p.name)}')">⬆</button>
           <button class="icon-act" title="${escapeHtml(T('keys.check_now'))}" onclick="checkProfileNow('${esc(p.name)}', 'quick')">🔄</button>
           <button class="icon-act" title="${escapeHtml(T('keys.deep_check'))}" onclick="checkProfileNow('${esc(p.name)}', 'deep')">🔬</button>
@@ -3273,6 +3280,14 @@ function toggleKey(i, fullKey) {
   const showing = el.dataset.showing === '1';
   el.textContent = showing ? maskKey(fullKey) : (fullKey || '—');
   el.dataset.showing = showing ? '0' : '1';
+}
+// 🌟 = "I checked this key myself and it works well". Saved with the key; unrelated to the gateway's ★ active key.
+function toggleStar(name) {
+  const profiles = getProfiles();
+  const p = profiles.find(x => x.name === name);
+  if (!p) return;
+  if (p.starred) delete p.starred; else p.starred = true;
+  setProfiles(profiles); renderArchive();
 }
 function updateSource(name, val) {
   const profiles = getProfiles();
