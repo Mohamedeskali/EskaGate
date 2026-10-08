@@ -1754,6 +1754,16 @@ INDEX_HTML = r"""
 
   /* ---------- GATEWAY TABS ---------- */
   .gw-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+  .gw-routing { margin-bottom: 16px; }
+  .gw-routing fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+  .gw-routing .routing-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .gw-routing .routing-row > label { flex: 1; }
+  .gw-routing .toggle { padding: 0; min-height: 0; }
+  .gw-routing ol { padding-inline-start: 24px; margin: 10px 0; }
+  .gw-routing li { margin: 6px 0; }
+  .gw-routing .routing-model { display: flex; align-items: center; gap: 6px; }
+  .gw-routing .routing-model bdi { flex: 1; overflow-wrap: anywhere; min-width: 0; }
+  .gw-routing select { flex: 1; min-width: 0; }
   @media (max-width: 980px) { .gw-grid { grid-template-columns: 1fr; } }
   .kv-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 8px; border-radius: var(--radius-sm);
     background: var(--surface-2); border: 1px solid var(--line-soft); min-width: 0; }
@@ -2350,6 +2360,21 @@ INDEX_HTML = r"""
         <p class="modal-desc" style="margin:10px 0 0;">{{h:gw.models_hint}}</p>
       </section>
     </div>
+    <section class="control-panel gw-routing">
+      <div class="control-panel-title">{{t:gw.routing_title}}</div>
+      <fieldset id="gwRoutingControls">
+        <div class="routing-row"><label for="gwFallbackToggle">{{t:gw.fallback_label}}</label>
+          <button type="button" class="toggle" id="gwFallbackToggle" role="switch" aria-checked="false" aria-label="{{t:gw.fallback_label}}" onclick="saveGatewayRouting({fallbackEnabled: !this.classList.contains('on')})"></button></div>
+        <div id="gwFallbackSettings" hidden>
+          <p class="modal-desc" style="margin:10px 0;">{{t:gw.fallback_hint}}</p>
+          <ol id="gwFallbackModels"></ol>
+          <div class="routing-row"><select id="gwFallbackAdd" aria-label="{{t:gw.fallback_pick}}"></select>
+            <button type="button" class="ghost sm" style="width:auto;" id="gwFallbackAddBtn" onclick="addGatewayFallback()">{{t:gw.fallback_add}}</button></div>
+        </div>
+        <div class="routing-row"><label for="gwQuotaSaverToggle">{{t:gw.quota_saver_label}}</label>
+          <button type="button" class="toggle" id="gwQuotaSaverToggle" role="switch" aria-checked="false" aria-label="{{t:gw.quota_saver_label}}" onclick="saveGatewayRouting({quotaSaverEnabled: !this.classList.contains('on')})"></button></div>
+      </fieldset>
+    </section>
     <div class="card">
       <div class="card-head">
         <h3>{{t:gw.log}}</h3>
@@ -2363,7 +2388,7 @@ INDEX_HTML = r"""
       </div>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>{{t:gw.th_time}}</th><th>{{t:gw.th_client}}</th><th>{{t:test.th_model}}</th><th>{{t:gw.th_provkey}}</th><th>{{t:test.th_status}}</th><th>tokens</th><th>{{t:gw.th_duration}}</th></tr></thead>
+          <thead><tr><th>{{t:gw.th_time}}</th><th>{{t:gw.th_client}}</th><th>{{t:test.th_model}}</th><th>{{t:gw.th_provkey}}</th><th>{{t:test.th_status}}</th><th>{{t:gw.th_tokens}}</th><th>{{t:gw.th_duration}}</th></tr></thead>
           <tbody id="logsBody"><tr class="empty-row"><td colspan="7">{{t:gw.no_requests}}</td></tr></tbody>
         </table>
       </div>
@@ -4462,6 +4487,49 @@ function renderGatewayInfo() {
   document.getElementById('gwModels').innerHTML = gwState.models.length
     ? gwState.models.map(m => `<span class="model-tag">${escapeHtml(m)}</span>`).join('')
     : `<span class="modal-desc" style="margin:0;">${T('gw.no_models')}</span>`;
+  renderGatewayRouting();
+}
+let gwRoutingSaving = false;
+function renderGatewayRouting() {
+  const s = gwState.routing_settings || {}, list = s.fallbackModels || [];
+  document.getElementById('gwRoutingControls').disabled = gwRoutingSaving;
+  for (const [id, enabled] of [['gwFallbackToggle', s.fallbackEnabled], ['gwQuotaSaverToggle', s.quotaSaverEnabled]]) {
+    const el = document.getElementById(id);
+    el.classList.toggle('on', !!enabled); el.setAttribute('aria-checked', String(!!enabled));
+  }
+  document.getElementById('gwFallbackSettings').hidden = !s.fallbackEnabled;
+  document.getElementById('gwFallbackModels').innerHTML = list.map((m, i) => `<li><div class="routing-model">
+    <bdi dir="ltr">${escapeHtml(m)}</bdi>
+    <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_up'))}" aria-label="${escapeHtml(T('gw.fallback_up'))}" ${i === 0 ? 'disabled' : ''} onclick="moveGatewayFallback(${i}, -1)">↑</button>
+    <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_down'))}" aria-label="${escapeHtml(T('gw.fallback_down'))}" ${i === list.length - 1 ? 'disabled' : ''} onclick="moveGatewayFallback(${i}, 1)">↓</button>
+    <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_remove'))}" aria-label="${escapeHtml(T('gw.fallback_remove'))}" onclick="moveGatewayFallback(${i}, 0)">✕</button>
+    </div></li>`).join('');
+  const choices = gwState.models.filter(m => !list.includes(m));
+  document.getElementById('gwFallbackAdd').innerHTML = `<option value="">${escapeHtml(T('gw.fallback_pick'))}</option>`
+    + choices.map(m => `<option value="${escapeHtml(m)}" dir="ltr">${escapeHtml(m)}</option>`).join('');
+  document.getElementById('gwFallbackAddBtn').disabled = !choices.length;
+}
+async function saveGatewayRouting(patch) {
+  if (gwRoutingSaving) return;
+  gwRoutingSaving = true; document.getElementById('gwRoutingControls').disabled = true;
+  try { gwState = await api('/api/gateway/routing', patch); }
+  catch (e) { toast(T('common.error'), 'bad', e.message); }
+  finally { gwRoutingSaving = false; renderGatewayInfo(); }
+}
+function addGatewayFallback() {
+  const model = document.getElementById('gwFallbackAdd').value;
+  const list = (gwState.routing_settings || {}).fallbackModels || [];
+  if (model && gwState.models.includes(model) && !list.includes(model)) saveGatewayRouting({fallbackModels: [...list, model]});
+}
+function moveGatewayFallback(index, direction) {
+  const list = [...((gwState.routing_settings || {}).fallbackModels || [])];
+  if (index < 0 || index >= list.length) return;
+  if (!direction) list.splice(index, 1);
+  else {
+    const next = index + direction; if (next < 0 || next >= list.length) return;
+    [list[index], list[next]] = [list[next], list[index]];
+  }
+  saveGatewayRouting({fallbackModels: list});
 }
 function toggleLocalKey() { showLocalKey = !showLocalKey; renderGatewayInfo(); }
 async function regenerateLocalKey() {
@@ -4486,14 +4554,19 @@ async function loadLogs() {
   body.innerHTML = logs.map(l => {
     const t = new Date(l.time * 1000);
     const ok = l.status === 'ok';
-    const tokens = (l.tokens_in != null || l.tokens_out != null) ? `${l.tokens_in ?? '?'} → ${l.tokens_out ?? '?'}` : '—';
+    const local = l.status === 'local';
+    const tokens = (l.tokens_in != null || l.tokens_out != null) ? T('log.tokens', {
+      input: `<bdi dir="ltr">${escapeHtml(String(l.tokens_in ?? '?'))}</bdi>`,
+      output: `<bdi dir="ltr">${escapeHtml(String(l.tokens_out ?? '?'))}</bdi>` }) : '—';
+    const original = l.original_model || l.model || '', used = l.used_model || l.model || original;
+    const model = `<bdi dir="ltr">${escapeHtml(original)}${used !== original ? ` → ${escapeHtml(used)}` : ''}</bdi>`;
     const fo = l.failovers ? ` <span class="sub-metric">${T('log.failovers', { n: l.failovers })}</span>` : '';
     return `<tr>
       <td class="mono" style="font-size:11.5px;">${t.toLocaleTimeString()}</td>
       <td>${escapeHtml(l.client || '')}<span class="sub-metric">${escapeHtml(l.format || '')}${l.stream ? ' · stream' : ''}</span></td>
-      <td class="mono">${escapeHtml(l.model || '')}</td>
+      <td class="mono">${model}</td>
       <td>${escapeHtml(l.provider || '—')}<span class="sub-metric" dir="ltr">${escapeHtml(l.key || '')}</span>${fo}</td>
-      <td><span class="pill ${ok ? 'ok' : 'bad'}">${ok ? T('log.ok') : T('common.error')} ${l.code || ''}</span>${l.error ? `<span class="sub-metric" style="white-space:normal; max-width:320px;" title="${escapeHtml(l.error)}">${escapeHtml(l.error.slice(0, 90))}</span>` : ''}</td>
+      <td><span class="pill ${ok ? 'ok' : local ? '' : 'bad'}">${local ? T('log.local') : ok ? T('log.ok') : T('common.error')} ${escapeHtml(String(l.code || ''))}</span>${l.error ? `<span class="sub-metric" style="white-space:normal; max-width:320px;" title="${escapeHtml(l.error)}">${escapeHtml(l.error.slice(0, 90))}</span>` : ''}</td>
       <td class="mono">${tokens}</td>
       <td class="mono">${l.ms != null ? (l.ms / 1000).toFixed(2) + 's' : '—'}</td>
     </tr>`;
@@ -4547,11 +4620,53 @@ async function clearGatewayLogs() {
 const AGENT_ICON = { claude: '✳️', opencode: '⌨️', pi: 'π', hermes: '🪽' };
 let agentsCache = [];
 let iconTarget = null;
+let claudeTierSettings = { claudeTiersEnabled: false, claudeTierLarge: '', claudeTierMedium: '', claudeTierSmall: '' };
+let claudeTierSaving = false;
+const CLAUDE_TIERS = ['Large', 'Medium', 'Small'];
+const CLAUDE_TIER_LABELS = { Large: 'agents.claude_tier_large', Medium: 'agents.claude_tier_medium', Small: 'agents.claude_tier_small' };
+function claudeTierKey(id) { return id.startsWith('claudeTier') && CLAUDE_TIERS.includes(id.slice(10)) ? id : ''; }
 async function loadAgents() {
   let r;
   try { r = await api('/api/agents'); } catch (e) { toast(T('agents.load_failed'), 'bad', e.message); return; }
   reasoningModels = new Set(r.reasoning_models || []);
+  try {
+    const state = await api('/api/gateway/state');
+    claudeTierSettings = { ...claudeTierSettings, ...(state.routing_settings || {}) };
+  } catch (e) { toast(T('common.not_saved'), 'bad', e.message); }
   renderAgents(r.agents, r.models);
+}
+function claudeTiersHtml(a) {
+  const on = claudeTierSettings.claudeTiersEnabled;
+  return `<label class="effort-row"><input type="checkbox" ${on ? 'checked' : ''} ${claudeTierSaving ? 'disabled' : ''}
+      onchange="saveClaudeTiers({claudeTiersEnabled: this.checked})"><span>${T('agents.claude_tiers')}</span></label>
+    ${on ? `<div class="agent-model-block">${CLAUDE_TIERS.map(tier => {
+      const id = 'claudeTier' + tier, value = claudeTierSettings[id] || '';
+      return `<label class="effort-row">${T(CLAUDE_TIER_LABELS[tier])}</label>
+        <div class="mdd" id="mdd-${id}"><input type="hidden" id="agentModel-${id}" value="${escapeHtml(value)}">
+          <button type="button" class="mdd-field" ${claudeTierSaving ? 'disabled' : ''} onclick="toggleModelDropdown('${id}')">
+            <span class="mdd-val" dir="auto" id="mddVal-${id}">${value ? escapeHtml(value) : T('agents.claude_tier_default')}</span>
+            <svg class="mdd-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l4 4 4-4"/></svg></button>
+          <div class="mdd-panel"><input class="mdd-search" id="mddSearch-${id}" dir="auto" placeholder="${escapeHtml(T('agents.search_ph'))}"
+            autocomplete="off" oninput="renderModelDropdown()" onkeydown="modelDropdownKey(event)">
+            <div class="mdd-list" id="mddList-${id}"></div></div></div>`;
+    }).join('')}<div class="meta">${T('agents.claude_tier_note')}</div></div>` : ''}`;
+}
+async function saveClaudeTiers(changes) {
+  if (claudeTierSaving) return;
+  claudeTierSaving = true;
+  closeModelDropdown();
+  renderAgents(agentsCache, agentModelsAll);
+  try {
+    const state = await api('/api/gateway/routing', changes);
+    claudeTierSettings = { ...claudeTierSettings, ...state.routing_settings };
+    const a = agentsCache.find(a => a.id === 'claude');
+    if (a && a.enabled) {
+      const r = await api('/api/agents/enable', { agent: 'claude', model: a.model, effort: a.effort || '' });
+      agentsCache = r.agents;
+    }
+    toast(T('agents.claude_tiers_saved'), 'ok', a && a.enabled ? T('agents.restart_hint') : '');
+  } catch (e) { toast(T('common.not_saved'), 'bad', e.message); }
+  finally { claudeTierSaving = false; renderAgents(agentsCache, agentModelsAll); }
 }
 function agentIconHtml(a) {
   return a.icon ? `<img src="${escapeHtml(a.icon)}" alt="">` : (AGENT_ICON[a.id] || '🤖');
@@ -4616,6 +4731,7 @@ function renderAgents(list, models) {
         <div id="effortRow-${a.id}">${effortSelectHtml(a.id, cur, a.installed && models.length)}</div>
         ${filtered ? `<div class="agent-filter-info">${T('agents.filter_info', { shown: shown.length, total: models.length })}</div>` : ''}
       </div>
+      ${a.id === 'claude' ? claudeTiersHtml(a) : ''}
       <div class="row">
         <button class="primary" ${a.installed && models.length ? '' : 'disabled'} onclick="enableAgent('${esc(a.id)}')">${a.enabled ? T('agents.update') : T('agents.enable')}</button>
         <button class="ghost" ${a.enabled ? '' : 'disabled'} onclick="disableAgent('${esc(a.id)}')">${T('agents.disable')}</button>
@@ -4662,8 +4778,8 @@ function toggleModelDropdown(id) {
   if (mdd && mdd.id === id) return closeModelDropdown();
   closeModelDropdown();
   const a = agentsCache.find(x => x.id === id);
-  if (!a) return;
-  mdd = { id, marked: new Set((a.model_filter || []).filter(m => agentModelsAll.includes(m))), dirty: false };
+  if (!a && !claudeTierKey(id)) return;
+  mdd = { id, marked: new Set(((a && a.model_filter) || []).filter(m => agentModelsAll.includes(m))), dirty: false };
   document.getElementById('mdd-' + id).classList.add('open');
   const search = document.getElementById('mddSearch-' + id);
   search.value = '';
@@ -4679,6 +4795,12 @@ function mddHits() {
 function renderModelDropdown() {
   if (!mdd) return;
   const cur = document.getElementById('agentModel-' + mdd.id).value;
+  if (claudeTierKey(mdd.id)) {
+    document.getElementById('mddList-' + mdd.id).innerHTML =
+      `<div class="mdd-row ${cur ? '' : 'sel'}" onclick="chooseDropdownModel(-1)"><span class="mdd-name">${T('agents.claude_tier_default')}</span></div>` +
+      mddHits().map(m => `<div class="mdd-row ${m === cur ? 'sel' : ''}" onclick="chooseDropdownModel(${agentModelsAll.indexOf(m)})"><span class="mdd-name" dir="ltr">${escapeHtml(m)}</span></div>`).join('');
+    return;
+  }
   document.getElementById('mddList-' + mdd.id).innerHTML = mddHits().map(m => {
     const i = agentModelsAll.indexOf(m);
     return `<div class="mdd-row ${m === cur ? 'sel' : ''}" onclick="chooseDropdownModel(${i})">
@@ -4718,6 +4840,12 @@ function markShownModels(on) {
   renderModelDropdown();
 }
 function chooseDropdownModel(i) {
+  if (claudeTierKey(mdd.id)) {
+    const key = mdd.id, value = i < 0 ? '' : agentModelsAll[i];
+    closeModelDropdown();
+    saveClaudeTiers({ [key]: value });
+    return;
+  }
   const m = agentModelsAll[i];
   if (mdd.marked.size && !mdd.marked.has(m)) { mdd.marked.add(m); mdd.dirty = true; }
   setDropdownValue(m);
@@ -5034,6 +5162,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"local_key": st.local_key, "root": root, "openai_base": root + "/v1",
                 "anthropic_base": root, "providers": st.public_view(), "models": models,
                 "reasoning_models": [m for m in models if gateway.supports_reasoning(m)],
+                "routing_settings": i18n.get_routing_settings(),
                 "data_dir": str(gateway.DATA_DIR)}
 
     # ---- routes ------------------------------------------------------------
@@ -5115,6 +5244,8 @@ class Handler(BaseHTTPRequestHandler):
         root = self._gateway_root()
         if path == "/api/providers/save":
             gateway.save_provider(p)
+        elif path == "/api/gateway/routing":
+            i18n.save_routing_settings(p)
         elif path == "/api/providers/delete":
             gateway.delete_provider(p.get("id"))
         elif path == "/api/providers/keys/add":

@@ -59,7 +59,9 @@ def _backup(agent, path):
     if not Path(path).exists():
         return None
     dest = BACKUP_DIR / f"{agent}-{time.strftime('%Y%m%d-%H%M%S')}{Path(path).suffix}.bak"
-    gateway.write_private(dest, Path(path).read_text(encoding="utf-8"))
+    text = (Path(path).read_bytes().decode("utf-8") if agent == "claude"
+            else Path(path).read_text(encoding="utf-8"))
+    gateway.write_private(dest, text)
     return str(dest)
 
 
@@ -170,16 +172,31 @@ class JsonAgent:
             originals = previous["originals"]
             backup = previous["backup"]
             existed = previous["existed"]
+            for k in changes:
+                encoded = json.dumps(k)
+                if self.id == "claude" and encoded not in originals:
+                    originals[encoded] = _get(data, k)
+                elif self.id == "claude" and encoded in previous.get("written_values", {}) \
+                        and _get(data, k) != previous["written_values"][encoded]:
+                    # A user edit made before Update becomes the value to restore.
+                    originals[encoded] = _get(data, k)
         else:
             originals = {json.dumps(k): _get(data, k) for k in changes}
             backup = _backup(self.id, path)
             existed = Path(path).exists()
+        exact_ok = not previous or (previous.get("exact_ok", True)
+                                    and _sha(path) == previous.get("written_hash"))
         for k, v in changes.items():
             _set(data, k, v)
         _write_json(path, data)
         state[self.id] = {"enabled": True, "path": str(path), "backup": backup, "existed": existed,
                           "originals": originals, "written_hash": _sha(path), "model": model,
-                          "base_url": base_url, "since": time.time()}
+                          "base_url": base_url, "since": time.time(), "exact_ok": exact_ok,
+                          "written_values": {json.dumps(k): v for k, v in changes.items()}}
+        if self.id == "claude":
+            state[self.id]["tiers_managed"] = bool(
+                i18n.get_routing_settings().get("claudeTiersEnabled")
+                or (previous or {}).get("tiers_managed"))
         _save_state(state)
 
     def disable(self):
@@ -188,16 +205,22 @@ class JsonAgent:
         if not info or not info.get("enabled"):
             raise ValueError(i18n.t("err.not_enabled_by_gw"))
         path = Path(info["path"])
-        if _sha(path) == info.get("written_hash"):
+        if _sha(path) == info.get("written_hash") and (self.id != "claude" or info.get("exact_ok", True)):
             # Untouched since we wrote it: put the original file back exactly.
             if info.get("backup") and Path(info["backup"]).exists():
-                path.write_text(Path(info["backup"]).read_text(encoding="utf-8"), encoding="utf-8")
+                if self.id == "claude":
+                    path.write_bytes(Path(info["backup"]).read_bytes())
+                else:
+                    path.write_text(Path(info["backup"]).read_text(encoding="utf-8"), encoding="utf-8")
             elif not info.get("existed"):
                 path.unlink(missing_ok=True)
             restored = "exact"
         else:
             data = _read_json(path)
             for k, v in info["originals"].items():
+                if self.id == "claude" and k in info.get("written_values", {}) \
+                        and _get(data, json.loads(k)) != info["written_values"][k]:
+                    continue
                 _set(data, json.loads(k), v)
             self.cleanup(data)
             _write_json(path, data)
@@ -238,16 +261,22 @@ class ClaudeCode(JsonAgent):
         return Path(root) / "settings.json"
 
     def changes(self, base_url, local_key, model, models):
-        return {
+        settings = i18n.get_routing_settings()
+        changes = {
             ("env", "ANTHROPIC_BASE_URL"): base_url,            # Claude Code appends /v1/messages
             ("env", "ANTHROPIC_AUTH_TOKEN"): local_key,         # sent as Authorization: Bearer
             ("env", "ANTHROPIC_API_KEY"): MISSING,              # would take precedence over the token
             ("env", "ANTHROPIC_MODEL"): model,
-            ("env", "ANTHROPIC_DEFAULT_OPUS_MODEL"): model,     # the "opus"/"sonnet"/"haiku" aliases
-            ("env", "ANTHROPIC_DEFAULT_SONNET_MODEL"): model,
-            ("env", "ANTHROPIC_DEFAULT_HAIKU_MODEL"): model,
-            ("env", "CLAUDE_CODE_SUBAGENT_MODEL"): model,
+            ("env", "CLAUDE_CODE_SUBAGENT_MODEL"): MISSING if settings.get("claudeTiersEnabled") else model,
         }
+        # Documented Claude Code aliases, not arbitrary tier environment names.
+        managed = _load_state().get(self.id, {}).get("tiers_managed", False)
+        for tier, alias in (("Large", "OPUS"), ("Medium", "SONNET"), ("Small", "HAIKU")):
+            value = settings.get("claudeTier" + tier, "").strip()
+            changes[("env", "ANTHROPIC_DEFAULT_" + alias + "_MODEL")] = (
+                (value or MISSING) if settings.get("claudeTiersEnabled")
+                else MISSING if managed else model)
+        return changes
 
     def is_ours(self, data, base_url):
         return _get(data, ("env", "ANTHROPIC_BASE_URL")) == base_url

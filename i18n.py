@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 LANGS = ("ar", "en", "fr")
@@ -28,6 +29,51 @@ SETTINGS_FILE = DATA_DIR / "ui-settings.json"
 
 _cache = {}
 _lang = None
+SETTINGS_LOCK = threading.RLock()
+ROUTING_DEFAULTS = {
+    "fallbackEnabled": False, "fallbackModels": [], "quotaSaverEnabled": False,
+    "claudeTiersEnabled": False, "claudeTierLarge": "", "claudeTierMedium": "", "claudeTierSmall": "",
+}
+
+
+def get_routing_settings():
+    with SETTINGS_LOCK:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        return {k: data.get(k, list(v) if isinstance(v, list) else v) for k, v in ROUTING_DEFAULTS.items()}
+
+
+def save_routing_settings(changes):
+    import gateway
+    values = {}
+    for key, value in changes.items():
+        if key not in ROUTING_DEFAULTS:
+            raise ValueError(t("routing.unknown_setting"))
+        default = ROUTING_DEFAULTS[key]
+        if isinstance(default, bool):
+            valid = isinstance(value, bool)
+        elif isinstance(default, list):
+            valid = isinstance(value, list) and all(isinstance(m, str) and m.strip() for m in value)
+            value = list(dict.fromkeys(value)) if valid else value
+        else:
+            valid = isinstance(value, str)
+        if not valid:
+            raise ValueError(t("routing.invalid_setting"))
+        values[key] = value
+    with SETTINGS_LOCK:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data.update(values)
+        gateway.write_private(SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
+        return get_routing_settings()
 
 
 def load(lang):
@@ -56,13 +102,14 @@ def set_lang(lang):
     if lang not in LANGS:
         raise ValueError(t("srv.bad_lang"))
     import gateway  # owner-only write, like every other file in the data folder
-    try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        data = data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        data = {}
-    data["lang"] = lang
-    gateway.write_private(SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
+    with SETTINGS_LOCK:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            data = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            data = {}
+        data["lang"] = lang
+        gateway.write_private(SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
     _lang = lang
 
 

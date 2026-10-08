@@ -26,6 +26,7 @@ from pathlib import Path
 
 import detect
 import i18n
+import quota_saver
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -584,6 +585,65 @@ class GatewayError(Exception):
 
 
 def dispatch(client_fmt, body, incoming_headers, timeout=300):
+    settings = i18n.get_routing_settings()
+    if not settings.get("fallbackEnabled", False):
+        return _dispatch_model(client_fmt, body, incoming_headers, timeout)
+    original, _ = split_effort(body.get("model"))
+    models, seen = [body.get("model")], {original}
+    for name in settings.get("fallbackModels", []):
+        base, _ = split_effort(name)
+        if base and base not in seen:
+            seen.add(base)
+            models.append(name)
+    attempts = []
+    for index, model in enumerate(models):
+        try:
+            result = _dispatch_model(client_fmt, {**body, "model": model}, incoming_headers,
+                                     timeout, prefetch=True, attempts=attempts)
+            result[4].routed_model = model
+            return result
+        except GatewayError as e:
+            if not getattr(e, "fallback_allowed", False) or index == len(models) - 1:
+                raise
+
+
+class _PrefetchedResponse:
+    """Replay bytes read before committing the client response, then continue upstream."""
+    def __init__(self, response, prefix):
+        self.response, self.prefix = response, prefix
+        self.headers = response.headers
+
+    def read(self):
+        return self.prefix
+
+    def __iter__(self):
+        yield from self.prefix.splitlines(keepends=True)
+        yield from self.response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.response.close()
+
+
+def _prefetch_response(resp, stream):
+    if not stream:
+        return _PrefetchedResponse(resp, resp.read())
+    # Read a complete first SSE event, including any leading comments. Translation
+    # may emit a synthetic message_start before reading upstream, so probe here.
+    prefix, has_data = [], False
+    for raw in resp:
+        prefix.append(raw)
+        has_data = has_data or raw.startswith(b"data:")
+        if has_data and not raw.strip():
+            return _PrefetchedResponse(resp, b"".join(prefix))
+    if has_data:
+        return _PrefetchedResponse(resp, b"".join(prefix))
+    raise OSError("Upstream closed before sending a stream event.")
+
+
+def _dispatch_model(client_fmt, body, incoming_headers, timeout=300, prefetch=False, attempts=None):
     """
     Try every (provider, key) candidate until one answers 2xx.
     Returns (provider, key, upstream_fmt, upstream_model, response, attempts).
@@ -598,7 +658,8 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
         raise GatewayError(404, f"Model '{model}' is not served by any provider. Available: {available}",
                            "not_found_error")
 
-    attempts = []
+    attempts = [] if attempts is None else attempts
+    fallback_allowed = True
     last_status, last_err = 502, "No provider answered."
     for t_index, (provider, upstream_model) in enumerate(targets):
         up_fmt = provider.get("format", "openai")
@@ -637,12 +698,23 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
                 NO_MAX_TOKENS.add((provider["id"], upstream_model))
                 status, resp, err = open_upstream(url, headers, up_body, timeout)
             if resp is not None and 200 <= status < 300:
+                if prefetch:
+                    import http.client
+                    try:
+                        resp = _prefetch_response(resp, bool(body.get("stream")))
+                    except (OSError, EOFError, http.client.HTTPException) as e:
+                        resp.close()
+                        status, resp, err = 0, None, {"error": {"message": str(e)}}
+            if resp is not None and 200 <= status < 300:
                 record_quota(provider, key, parse_quota(resp.headers))
                 mark_key(provider, key, True)
                 _emit("key_ok", provider_id=provider["id"], provider=provider["name"], key_id=key["id"],
                       key=mask_key(key["key"]))
                 return provider, key, up_fmt, upstream_model, resp, attempts
             kind, try_next = classify(status, err)
+            if prefetch and (status in (400, 404) or not (
+                    status in (0, 401, 402, 403, 429) or 500 <= status < 600 or kind == "no_credit")):
+                fallback_allowed = False
             msg = short_error(err)
             attempts.append({"provider": provider["name"], "key": mask_key(key["key"]),
                              "status": status, "reason": kind})
@@ -663,8 +735,10 @@ def dispatch(client_fmt, body, incoming_headers, timeout=300):
         now = time.time()
         if not model_missing and keys and all(k.get("cooldown_until", 0) > now for k in provider.get("keys", [])):
             _emit("provider_down", provider_id=provider["id"], provider=provider["name"], keys=len(keys))
-    raise GatewayError(last_status if last_status in (401, 402, 403, 404, 429) else 502,
-                       f"All keys failed. Last error: {last_err}")
+    error = GatewayError(last_status if last_status in (401, 402, 403, 404, 429) else 502,
+                         f"All keys failed. Last error: {last_err}")
+    error.fallback_allowed = fallback_allowed
+    raise error
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1175,10 @@ def handle(handler, method):
             if not any(d["id"] == m for d in data):
                 data.append({"id": m, "object": "model", "type": "model", "created": now,
                              "owned_by": "gateway", "display_name": m})
+        if fmt == "anthropic":
+            for d in data:
+                # Release dates are not known for routed models.
+                d["created_at"] = "1970-01-01T00:00:00Z"
         return _send_json(handler, 200, {"object": "list", "data": data, "has_more": False,
                                          "first_id": data[0]["id"] if data else None,
                                          "last_id": data[-1]["id"] if data else None})
@@ -1130,12 +1208,16 @@ def handle(handler, method):
 
     _emit("request", client=log["client"], phase="start")
     try:
+        if i18n.get_routing_settings()["quotaSaverEnabled"] and quota_saver.maybe_handle(
+                handler, body, client_fmt, log, start):
+            return
         return _proxy(handler, body, client_fmt, model, stream, start, log, incoming)
     finally:
         _emit("request", client=log["client"], phase="end")
 
 
 def _proxy(handler, body, client_fmt, model, stream, start, log, incoming):
+    log.update(original_model=model, used_model="")
     try:
         provider, key, up_fmt, up_model, resp, attempts = dispatch(client_fmt, body, incoming)
     except GatewayError as e:
@@ -1144,7 +1226,7 @@ def _proxy(handler, body, client_fmt, model, stream, start, log, incoming):
         return _send_error(handler, client_fmt, e.status, e.message, e.kind)
 
     log.update(provider=provider["name"], key=mask_key(key["key"]), upstream_format=up_fmt,
-               failovers=len(attempts))
+               failovers=len(attempts), used_model=getattr(resp, "routed_model", model))
     usage = {}
     try:
         with resp:
