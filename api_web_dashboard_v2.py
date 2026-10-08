@@ -1758,12 +1758,14 @@ INDEX_HTML = r"""
   .gw-routing fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
   .gw-routing .routing-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
   .gw-routing .routing-row > label { flex: 1; }
-  .gw-routing .toggle { padding: 0; min-height: 0; }
+  .gw-routing .toggle, .agent-card .toggle { padding: 0; min-height: 0; }
+  .agent-tier-toggle { display:flex; align-items:center; gap:12px; margin-top:10px; }
+  .agent-tier-toggle > label { flex:1; }
   .gw-routing ol { padding-inline-start: 24px; margin: 10px 0; }
   .gw-routing li { margin: 6px 0; }
   .gw-routing .routing-model { display: flex; align-items: center; gap: 6px; }
   .gw-routing .routing-model bdi { flex: 1; overflow-wrap: anywhere; min-width: 0; }
-  .gw-routing select { flex: 1; min-width: 0; }
+  .gw-routing .routing-row > .mdd { flex: 1; min-width: 0; }
   @media (max-width: 980px) { .gw-grid { grid-template-columns: 1fr; } }
   .kv-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 8px; border-radius: var(--radius-sm);
     background: var(--surface-2); border: 1px solid var(--line-soft); min-width: 0; }
@@ -2368,7 +2370,13 @@ INDEX_HTML = r"""
         <div id="gwFallbackSettings" hidden>
           <p class="modal-desc" style="margin:10px 0;">{{t:gw.fallback_hint}}</p>
           <ol id="gwFallbackModels"></ol>
-          <div class="routing-row"><select id="gwFallbackAdd" aria-label="{{t:gw.fallback_pick}}"></select>
+          <p class="meta" id="gwFallbackProviderHint" hidden>{{t:gw.fallback_provider_hint}}</p>
+          <div class="routing-row"><div class="mdd" id="mdd-gwFallback"><input type="hidden" id="gwFallbackAdd">
+            <button type="button" class="mdd-field" aria-label="{{t:gw.fallback_pick}}" onclick="toggleModelDropdown('gwFallback')">
+              <span class="mdd-val" dir="auto" id="mddVal-gwFallback">{{t:gw.fallback_pick}}</span>
+              <svg class="mdd-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l4 4 4-4"/></svg></button>
+            <div class="mdd-panel"><input class="mdd-search" id="mddSearch-gwFallback" dir="auto" placeholder="{{t:agents.search_ph}}" autocomplete="off"
+              oninput="renderModelDropdown()" onkeydown="modelDropdownKey(event)"><div class="mdd-list" id="mddList-gwFallback"></div></div></div>
             <button type="button" class="ghost sm" style="width:auto;" id="gwFallbackAddBtn" onclick="addGatewayFallback()">{{t:gw.fallback_add}}</button></div>
         </div>
         <div class="routing-row"><label for="gwQuotaSaverToggle">{{t:gw.quota_saver_label}}</label>
@@ -4246,6 +4254,9 @@ async function api(path, body) {
 async function loadGateway() {
   try { gwState = await api('/api/gateway/state'); }
   catch (e) { toast(T('gw.state_failed'), 'bad', e.message); return; }
+  if (!agentsCache.length) {
+    try { gwStoredAgents = (await api('/api/agents')).agents || []; } catch (e) {}
+  }
   renderProviders(); renderGatewayInfo();
 }
 
@@ -4490,6 +4501,36 @@ function renderGatewayInfo() {
   renderGatewayRouting();
 }
 let gwRoutingSaving = false;
+let gwStoredAgents = [];
+function routingModelBase(model) {
+  return String(model || '').replace(/(.+)@(none|minimal|low|medium|high|xhigh|max)$/, '$1');
+}
+function routingModelProviders(model) {
+  const base = routingModelBase(model);
+  return ((gwState && gwState.providers) || []).filter(p => (p.models || []).some(m => routingModelBase(m) === base));
+}
+function routingModelLabel(model) {
+  const names = [...new Set(routingModelProviders(model).map(p => p.name))];
+  return model + (names.length ? ' · ' + names.join(', ') : '');
+}
+function gatewayFallbackChoices() {
+  const used = new Set(((gwState.routing_settings || {}).fallbackModels || []).map(routingModelBase));
+  return (gwState.models || []).filter(m => {
+    const base = routingModelBase(m);
+    if (used.has(base)) return false;
+    used.add(base); return true;
+  });
+}
+function renderGatewayProviderHint() {
+  const hint = document.getElementById('gwFallbackProviderHint');
+  if (!hint || !gwState) return;
+  const a = agentsCache.find(a => a.id === 'claude') || gwStoredAgents.find(a => a.id === 'claude');
+  const field = document.getElementById('agentModel-claude');
+  const main = (field && field.value) || agentPick.claude || (a && a.model);
+  const list = (gwState.routing_settings || {}).fallbackModels || [];
+  const providers = routingModelProviders(main).filter(p => p.enabled !== false);
+  hint.hidden = !main || !list.length || !providers.some(p => list.every(m => routingModelProviders(m).some(x => x.id === p.id)));
+}
 function renderGatewayRouting() {
   const s = gwState.routing_settings || {}, list = s.fallbackModels || [];
   document.getElementById('gwRoutingControls').disabled = gwRoutingSaving;
@@ -4499,15 +4540,18 @@ function renderGatewayRouting() {
   }
   document.getElementById('gwFallbackSettings').hidden = !s.fallbackEnabled;
   document.getElementById('gwFallbackModels').innerHTML = list.map((m, i) => `<li><div class="routing-model">
-    <bdi dir="ltr">${escapeHtml(m)}</bdi>
+    <bdi dir="auto">${escapeHtml(routingModelLabel(m))}</bdi>
     <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_up'))}" aria-label="${escapeHtml(T('gw.fallback_up'))}" ${i === 0 ? 'disabled' : ''} onclick="moveGatewayFallback(${i}, -1)">↑</button>
     <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_down'))}" aria-label="${escapeHtml(T('gw.fallback_down'))}" ${i === list.length - 1 ? 'disabled' : ''} onclick="moveGatewayFallback(${i}, 1)">↓</button>
     <button type="button" class="mini-copy" title="${escapeHtml(T('gw.fallback_remove'))}" aria-label="${escapeHtml(T('gw.fallback_remove'))}" onclick="moveGatewayFallback(${i}, 0)">✕</button>
     </div></li>`).join('');
-  const choices = gwState.models.filter(m => !list.includes(m));
-  document.getElementById('gwFallbackAdd').innerHTML = `<option value="">${escapeHtml(T('gw.fallback_pick'))}</option>`
-    + choices.map(m => `<option value="${escapeHtml(m)}" dir="ltr">${escapeHtml(m)}</option>`).join('');
-  document.getElementById('gwFallbackAddBtn').disabled = !choices.length;
+  const choices = gatewayFallbackChoices(), field = document.getElementById('gwFallbackAdd');
+  if (!choices.includes(field.value)) field.value = '';
+  document.getElementById('mddVal-gwFallback').textContent = field.value ? routingModelLabel(field.value) : T('gw.fallback_pick');
+  document.querySelector('#mdd-gwFallback .mdd-field').disabled = gwRoutingSaving || !choices.length;
+  document.getElementById('gwFallbackAddBtn').disabled = gwRoutingSaving || !field.value;
+  if (mdd && mdd.id === 'gwFallback') renderModelDropdown();
+  renderGatewayProviderHint();
 }
 async function saveGatewayRouting(patch) {
   if (gwRoutingSaving) return;
@@ -4519,7 +4563,10 @@ async function saveGatewayRouting(patch) {
 function addGatewayFallback() {
   const model = document.getElementById('gwFallbackAdd').value;
   const list = (gwState.routing_settings || {}).fallbackModels || [];
-  if (model && gwState.models.includes(model) && !list.includes(model)) saveGatewayRouting({fallbackModels: [...list, model]});
+  if (model && gatewayFallbackChoices().includes(model)) {
+    closeModelDropdown();
+    saveGatewayRouting({fallbackModels: [...list, model]});
+  }
 }
 function moveGatewayFallback(index, direction) {
   const list = [...((gwState.routing_settings || {}).fallbackModels || [])];
@@ -4637,8 +4684,9 @@ async function loadAgents() {
 }
 function claudeTiersHtml(a) {
   const on = claudeTierSettings.claudeTiersEnabled;
-  return `<label class="effort-row"><input type="checkbox" ${on ? 'checked' : ''} ${claudeTierSaving ? 'disabled' : ''}
-      onchange="saveClaudeTiers({claudeTiersEnabled: this.checked})"><span>${T('agents.claude_tiers')}</span></label>
+  return `<div class="agent-tier-toggle"><label for="claudeTiersToggle">${T('agents.claude_tiers')}</label>
+    <button type="button" class="toggle ${on ? 'on' : ''}" id="claudeTiersToggle" role="switch" aria-checked="${!!on}" aria-label="${escapeHtml(T('agents.claude_tiers'))}" ${claudeTierSaving ? 'disabled' : ''}
+      onclick="saveClaudeTiers({claudeTiersEnabled: !this.classList.contains('on')})"></button></div>
     ${on ? `<div class="agent-model-block">${CLAUDE_TIERS.map(tier => {
       const id = 'claudeTier' + tier, value = claudeTierSettings[id] || '';
       return `<label class="effort-row">${T(CLAUDE_TIER_LABELS[tier])}</label>
@@ -4738,6 +4786,7 @@ function renderAgents(list, models) {
       </div>
     </div>`;
   }).join('');
+  renderGatewayProviderHint();
 }
 // Every word typed must appear in the model name (case-insensitive): "gpt 4o mini".
 function modelMatches(m, query) {
@@ -4778,7 +4827,7 @@ function toggleModelDropdown(id) {
   if (mdd && mdd.id === id) return closeModelDropdown();
   closeModelDropdown();
   const a = agentsCache.find(x => x.id === id);
-  if (!a && !claudeTierKey(id)) return;
+  if (!a && !claudeTierKey(id) && id !== 'gwFallback') return;
   mdd = { id, marked: new Set(((a && a.model_filter) || []).filter(m => agentModelsAll.includes(m))), dirty: false };
   document.getElementById('mdd-' + id).classList.add('open');
   const search = document.getElementById('mddSearch-' + id);
@@ -4790,10 +4839,18 @@ function toggleModelDropdown(id) {
 }
 function mddHits() {
   const q = document.getElementById('mddSearch-' + mdd.id).value.trim();
-  return q ? agentModelsAll.filter(m => modelMatches(m, q)) : agentModelsAll;
+  const models = mdd.id === 'gwFallback' ? gatewayFallbackChoices() : agentModelsAll;
+  return q ? models.filter(m => modelMatches(mdd.id === 'gwFallback' ? routingModelLabel(m) : m, q)) : models;
 }
 function renderModelDropdown() {
   if (!mdd) return;
+  if (mdd.id === 'gwFallback') {
+    const cur = document.getElementById('gwFallbackAdd').value;
+    document.getElementById('mddList-gwFallback').innerHTML = mddHits().map(m =>
+      `<div class="mdd-row ${m === cur ? 'sel' : ''}" onclick="chooseDropdownModel(${gwState.models.indexOf(m)})"><span class="mdd-name" dir="auto">${escapeHtml(routingModelLabel(m))}</span></div>`
+    ).join('') || `<div class="mdd-empty">${T('agents.none_found')}</div>`;
+    return;
+  }
   const cur = document.getElementById('agentModel-' + mdd.id).value;
   if (claudeTierKey(mdd.id)) {
     document.getElementById('mddList-' + mdd.id).innerHTML =
@@ -4820,6 +4877,7 @@ function setDropdownValue(m) {
   document.getElementById('mddVal-' + mdd.id).textContent = m;
   agentPick[mdd.id] = m;
   document.getElementById('effortRow-' + mdd.id).innerHTML = effortSelectHtml(mdd.id, m, true);
+  renderGatewayProviderHint();
 }
 // When models are marked, the agent's model has to be one of them.
 function keepValueInMarked() {
@@ -4840,6 +4898,13 @@ function markShownModels(on) {
   renderModelDropdown();
 }
 function chooseDropdownModel(i) {
+  if (mdd.id === 'gwFallback') {
+    const model = gwState.models[i];
+    if (!gatewayFallbackChoices().includes(model)) return;
+    document.getElementById('gwFallbackAdd').value = model;
+    closeModelDropdown(); renderGatewayRouting();
+    return;
+  }
   if (claudeTierKey(mdd.id)) {
     const key = mdd.id, value = i < 0 ? '' : agentModelsAll[i];
     closeModelDropdown();
@@ -4855,7 +4920,7 @@ function modelDropdownKey(e) {
   if (e.key === 'Enter') {
     e.preventDefault();
     const first = mddHits()[0];
-    if (first) chooseDropdownModel(agentModelsAll.indexOf(first));
+    if (first) chooseDropdownModel((mdd.id === 'gwFallback' ? gwState.models : agentModelsAll).indexOf(first));
   } else if (e.key === 'Escape') { e.stopPropagation(); closeModelDropdown(); }
 }
 async function closeModelDropdown() {

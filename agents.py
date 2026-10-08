@@ -274,7 +274,7 @@ class ClaudeCode(JsonAgent):
         for tier, alias in (("Large", "OPUS"), ("Medium", "SONNET"), ("Small", "HAIKU")):
             value = settings.get("claudeTier" + tier, "").strip()
             changes[("env", "ANTHROPIC_DEFAULT_" + alias + "_MODEL")] = (
-                (value or MISSING) if settings.get("claudeTiersEnabled")
+                (value or model) if settings.get("claudeTiersEnabled")
                 else MISSING if managed else model)
         return changes
 

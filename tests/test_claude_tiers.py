@@ -2,7 +2,10 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -112,12 +115,82 @@ class ClaudeTiersTests(unittest.TestCase):
         self.assertEqual(self.agent.disable(), 'values')
         self.assertEqual(self.read(), {'env': {'EXTRA': 'before'}, 'theme': 'light'})
 
-    def test_empty_on_tiers_remove_overrides(self):
+    def test_empty_on_tiers_use_main_model(self):
         self.write({'env': {'ANTHROPIC_DEFAULT_HAIKU_MODEL': 'original'}})
         i18n.save_routing_settings({'claudeTiersEnabled': True})
-        self.enable()
-        self.assertNotIn('ANTHROPIC_DEFAULT_HAIKU_MODEL', self.read()['env'])
+        self.enable('gemini-3-flash')
+        env = self.read()['env']
+        for alias in ('OPUS', 'SONNET', 'HAIKU'):
+            self.assertEqual(env['ANTHROPIC_DEFAULT_' + alias + '_MODEL'], 'gemini-3-flash')
+        self.assertNotIn('CLAUDE_CODE_SUBAGENT_MODEL', env)
         self.assertEqual(self.agent.disable(), 'exact')
+
+    def test_partial_tiers_preserve_explicit_models_and_main_effort(self):
+        i18n.save_routing_settings({'claudeTiersEnabled': True,
+                                   'claudeTierLarge': 'big', 'claudeTierMedium': '   '})
+        self.enable('gemini-3-flash@high')
+        env = self.read()['env']
+        self.assertEqual(env['ANTHROPIC_DEFAULT_OPUS_MODEL'], 'big')
+        for alias in ('SONNET', 'HAIKU'):
+            self.assertEqual(env['ANTHROPIC_DEFAULT_' + alias + '_MODEL'], 'gemini-3-flash@high')
+
+    def test_empty_tier_aliases_route_anthropic_http_to_main(self):
+        calls = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                calls.append((self.path, body['model']))
+                raw = json.dumps({'id': 'msg_test', 'type': 'message', 'role': 'assistant',
+                    'model': body['model'], 'content': [{'type': 'text', 'text': 'ok'}],
+                    'stop_reason': 'end_turn', 'usage': {'input_tokens': 1, 'output_tokens': 1}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                gateway.handle(self, 'POST')
+
+        servers = [ThreadingHTTPServer(('127.0.0.1', 0), cls) for cls in (Upstream, Handler)]
+        threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
+        for thread in threads:
+            thread.start()
+        try:
+            # Store file and singleton are isolated as well as the agent config.
+            with patch.object(gateway, 'STORE_FILE', self.home / 'data' / 'gateway.json'), \
+                    patch.object(gateway, 'STORE', None):
+                pid = gateway.save_provider({'name': 'fake', 'format': 'anthropic',
+                    'base_url': 'http://127.0.0.1:%d' % servers[0].server_port,
+                    'manual_models': 'gemini-3-flash'})
+                gateway.add_keys(pid, 'sk-fake-test-only')
+                i18n.save_routing_settings({'claudeTiersEnabled': True, 'fallbackEnabled': False})
+                self.enable('gemini-3-flash')
+                env = self.read()['env']
+                for alias in ('OPUS', 'SONNET', 'HAIKU'):
+                    model = env['ANTHROPIC_DEFAULT_' + alias + '_MODEL']
+                    request = urllib.request.Request('http://127.0.0.1:%d/v1/messages' % servers[1].server_port,
+                        data=json.dumps({'model': model, 'max_tokens': 1,
+                            'messages': [{'role': 'user', 'content': 'hi'}]}).encode(),
+                        headers={'Content-Type': 'application/json',
+                                 'x-api-key': gateway.store().local_key, 'anthropic-version': '2023-06-01'})
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    with opener.open(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(json.load(response)['model'], 'gemini-3-flash')
+                self.assertEqual(calls, [('/v1/messages', 'gemini-3-flash')] * 3)
+        finally:
+            for server, thread in zip(servers, threads):
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__ == '__main__':
